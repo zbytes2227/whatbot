@@ -13,6 +13,7 @@ export default async function handler(req, res) {
       success: false,
       msg: 'Only POST method allowed',
     });
+    
   }
 
 
