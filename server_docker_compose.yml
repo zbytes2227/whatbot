@@ -1,0 +1,25 @@
+services:
+  whatbot-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ujjwalzb/whatbot:latest
+    container_name: whatbot-app
+    restart: unless-stopped
+    
+    # Ports - only expose internally, use reverse proxy for external access
+    ports:
+      - "127.0.0.1:5000:3000"
+
+    # Environment variables for production
+    environment:
+      - NODE_ENV=production 
+      - ADMIN_USERNAME=tanu
+      - ADMIN_PASSWORD=tanu
+      - MONGODB_URI=mongodb+srv://zbytes1:yvnwXhOgOl6p44FS@cluster0.45jhcsq.mongodb.net/whatbots
+      - JWT_TOKEN_ADMIN=Op7Xactr@5fs
+      - JWT_TOKEN_STAFF=njjsPP028jSH
+      - TOKEN_API_PUBLIC=TANUTOKEN@CLIENT15000
+      
+ 
+ 

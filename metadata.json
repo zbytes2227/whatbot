@@ -1,0 +1,8 @@
+{
+  "name": "WhatMot",
+  "description": "WhatsApp campaign manager and messaging automation platform",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
