@@ -1,4 +1,4 @@
-import { clients, startClient, toggleClient, logoutClient } from '@/lib/whatsappClients';
+import { clients, startClient, toggleClient, logoutClient, getProfileLockDiagnostics } from '@/lib/whatsappClients';
 import { verifyAuth } from '@/lib/auth';
 import { createLogger, getRecentLogs, getRequestContext } from '@/lib/logger';
 
@@ -16,7 +16,7 @@ async function waitForQRCodeOrReady(clientId, timeoutMs = 10000) {
   }
 }
 
-function serializeClientStatus(client) {
+function serializeClientStatus(clientId, client) {
   return {
     ready: client.ready,
     hasQR: !!client.qrCode,
@@ -48,6 +48,7 @@ function serializeClientStatus(client) {
     lastBrowserDisconnect: client.lastBrowserDisconnect,
     lastAuthentication: client.lastAuthentication,
     lastQR: client.lastQR,
+    profileLocks: getProfileLockDiagnostics(clientId),
   };
 }
 
@@ -82,7 +83,7 @@ export default async function handler(req, res) {
       if (action === 'status') {
         const status = {};
         for (const [id, client] of Object.entries(clients)) {
-          status[id] = serializeClientStatus(client);
+          status[id] = serializeClientStatus(id, client);
         }
         return res.status(200).json({ success: true, clients: status });
       }
@@ -108,7 +109,7 @@ export default async function handler(req, res) {
         return res.status(200).json({
           success: true,
           clientId,
-          ...serializeClientStatus(clients[clientId]),
+          ...serializeClientStatus(clientId, clients[clientId]),
         });
       }
 
@@ -144,7 +145,7 @@ export default async function handler(req, res) {
           success: true,
           msg: `${clientId} ${enabled ? 'enabled' : 'disabled'} successfully`,
           enabled: clients[clientId].enabled,
-          status: serializeClientStatus(clients[clientId]),
+          status: serializeClientStatus(clientId, clients[clientId]),
         });
       }
 
@@ -184,7 +185,7 @@ export default async function handler(req, res) {
         return res.status(200).json({
           success: true,
           msg: `${clientId} restart initiated`,
-          status: serializeClientStatus(clients[clientId]),
+          status: serializeClientStatus(clientId, clients[clientId]),
         });
       }
 
