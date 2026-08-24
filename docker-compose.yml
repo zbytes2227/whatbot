@@ -4,6 +4,7 @@ services:
     image: whatsapp-backend
     container_name: whatsapp-backend
     restart: unless-stopped
+    init: true
     ports:
       - "3000:3000"
     env_file: 

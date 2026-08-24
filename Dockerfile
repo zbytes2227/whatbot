@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   libxss1 \
   libxtst6 \
   wget \
+  tini \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
@@ -66,4 +67,5 @@ USER node
 
 EXPOSE 3000
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["npm", "start"]

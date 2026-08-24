@@ -6,6 +6,7 @@ services:
     image: ujjwalzb/whatbot:latest
     container_name: whatbot-app
     restart: unless-stopped
+    init: true
     
     # Ports - only expose internally, use reverse proxy for external access
     ports:
