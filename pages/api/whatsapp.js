@@ -48,6 +48,7 @@ function serializeClientStatus(clientId, client) {
     lastBrowserDisconnect: client.lastBrowserDisconnect,
     lastAuthentication: client.lastAuthentication,
     lastQR: client.lastQR,
+    lastBridgeProbe: client.lastBridgeProbe,
     profileLocks: getProfileLockDiagnostics(clientId),
   };
 }
@@ -206,6 +207,7 @@ function getDetailedStatus(client) {
   if (client.status === 'initializing') return 'Connecting to WhatsApp...';
   if (client.status === 'authenticating') return 'Authenticating Session...';
   if (client.status === 'reconnecting') return client.error || 'Reconnecting to WhatsApp...';
+  if (client.status === 'degraded') return `Bridge unhealthy: ${client.error || 'recovering'}`;
   if (client.status === 'disconnected') return 'Disconnected - Toggle ON to Connect';
   if (client.status === 'error') return `Error: ${client.error || 'Unknown error'}`;
   return client.status || 'Unknown Status';
