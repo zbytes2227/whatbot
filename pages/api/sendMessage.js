@@ -1,4 +1,4 @@
-import { clients, enqueueClientOperation, withTimeout, OPERATION_TIMEOUT_MS } from '@/lib/whatsappClients';
+import { clients, sendWhatsAppMessage } from '@/lib/whatsappClients';
 import MessageHistory from '@/models/MessageHistory';
 import connectToMongoDB from '@/lib/mongodb';
 import { createLogger, getRequestContext } from '@/lib/logger';
@@ -93,24 +93,9 @@ export default async function handler(req, res) {
     const savedHistory = await messageHistory.save();
     messageHistoryId = savedHistory._id;
 
-    const selectedEntry = clients[selectedClientId];
-    const selectedGeneration = selectedEntry.generation;
     const chatId = `${formattedNumber}@c.us`;
-    let deliveryTime = 0;
-    await enqueueClientOperation(selectedClientId, selectedEntry, async () => {
-      if (!selectedEntry.ready || selectedEntry.client !== selectedClient || selectedEntry.generation !== selectedGeneration) {
-        throw new Error('WhatsApp client changed state while preparing the message');
-      }
-      const isRegistered = await withTimeout(selectedClient.isRegisteredUser(chatId), OPERATION_TIMEOUT_MS, 'WhatsApp number lookup');
-
-      if (!isRegistered) throw new Error('This number is not registered on WhatsApp');
-
-      const startTime = Date.now();
-      await withTimeout(selectedClient.sendMessage(chatId, msg.trim()), OPERATION_TIMEOUT_MS, 'WhatsApp message send');
-      deliveryTime = Date.now() - startTime;
-
-      await MessageHistory.findByIdAndUpdate(messageHistoryId, { deliveryStatus: 'sent', deliveryTime });
-    });
+    const { deliveryTime } = await sendWhatsAppMessage({ clientId: selectedClientId, chatId, text: msg.trim() });
+    await MessageHistory.findByIdAndUpdate(messageHistoryId, { deliveryStatus: 'sent', deliveryTime });
 
     logger.info('Message sent successfully', {
       clientId: selectedClientId,
@@ -136,13 +121,13 @@ export default async function handler(req, res) {
 
     if (messageHistoryId) {
       try {
-        await MessageHistory.findByIdAndUpdate(messageHistoryId, { deliveryStatus: 'failed' });
+        await MessageHistory.findByIdAndUpdate(messageHistoryId, { deliveryStatus: error.code === 'CLIENT_UNAVAILABLE' ? 'client_unavailable' : 'failed', error: error.message });
       } catch (updateError) {
         logger.error('Failed to update message history after send failure', { err: updateError, messageHistoryId });
       }
     }
 
-    return res.status(500).json({
+    return res.status(error.code === 'CLIENT_UNAVAILABLE' ? 503 : 500).json({
       success: false,
       msg: 'Failed to send message',
       details: error.message,

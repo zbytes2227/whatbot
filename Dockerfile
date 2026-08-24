@@ -52,6 +52,8 @@ FROM base AS runner
 ENV NODE_ENV=production
 ENV CHROME_BIN=/usr/bin/chromium
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
 
 WORKDIR /usr/src/app
 COPY --from=deps /usr/src/app/node_modules ./node_modules
@@ -68,4 +70,4 @@ USER node
 EXPOSE 3000
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["npm", "start"]
+CMD ["node", ".next/standalone/server.js"]

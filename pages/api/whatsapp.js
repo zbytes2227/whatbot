@@ -36,6 +36,18 @@ function serializeClientStatus(client) {
     sessionExists: !!client.client,
     reconnectAttempts: client.reconnectAttempts || 0,
     initInProgress: !!client.initInProgress,
+    generation: client.generation || 0,
+    bridgeState: client.bridgeState || 'unknown',
+    browserPid: client.client?.pupBrowser?.process?.()?.pid || null,
+    profileDir: client.profileDir || null,
+    queueLength: client.queueLength || 0,
+    activeOperation: client.activeOperation,
+    operationDuration: client.operationStartedAt ? Date.now() - new Date(client.operationStartedAt).getTime() : null,
+    lastSuccessfulBridgeOperation: client.lastSuccessfulBridgeOperation,
+    lastSuccessfulSend: client.lastSuccessfulSend,
+    lastBrowserDisconnect: client.lastBrowserDisconnect,
+    lastAuthentication: client.lastAuthentication,
+    lastQR: client.lastQR,
   };
 }
 

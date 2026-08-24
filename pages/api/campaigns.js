@@ -1,6 +1,6 @@
 import Campaign from '@/models/Campaigns';
 import ContactList from '@/models/ContactList';
-import { clients, enqueueClientOperation, withTimeout, OPERATION_TIMEOUT_MS } from '@/lib/whatsappClients';
+import { clients, sendWhatsAppMessage } from '@/lib/whatsappClients';
 import { verifyAuth } from '@/lib/auth';
 import formidable from 'formidable';
 import fs from 'fs';
@@ -336,28 +336,18 @@ async function runCampaign(campaignId, trigger = 'manual') {
 
     try {
       const chatId = `${item.formatted}@c.us`;
-      const clientEntry = clients[selectedClientId];
-      const clientGeneration = clientEntry.generation;
-      await enqueueClientOperation(selectedClientId, clientEntry, async () => {
-        if (!clientEntry.ready || clientEntry.client !== client || clientEntry.generation !== clientGeneration) {
-          throw new Error('WhatsApp client changed state during campaign send');
-        }
-        const isRegistered = await withTimeout(client.isRegisteredUser(chatId), OPERATION_TIMEOUT_MS, 'WhatsApp number lookup');
-        if (!isRegistered) throw new Error('User not registered on WhatsApp');
-
-        if (selectedMessage.hasMedia && selectedMessage.mediaData) {
-          const media = new MessageMedia(selectedMessage.mediaType, selectedMessage.mediaData, selectedMessage.mediaName);
-          if (selectedMessage.text.trim()) {
-            await withTimeout(client.sendMessage(chatId, media, { caption: selectedMessage.text }), OPERATION_TIMEOUT_MS, 'WhatsApp media send');
-          } else {
-            await withTimeout(client.sendMessage(chatId, media), OPERATION_TIMEOUT_MS, 'WhatsApp media send');
-          }
-        } else {
-          await withTimeout(client.sendMessage(chatId, selectedMessage.text), OPERATION_TIMEOUT_MS, 'WhatsApp message send');
-        }
+      const media = selectedMessage.hasMedia && selectedMessage.mediaData
+        ? new MessageMedia(selectedMessage.mediaType, selectedMessage.mediaData, selectedMessage.mediaName)
+        : null;
+      const { deliveryTime: measuredDeliveryTime } = await sendWhatsAppMessage({
+        clientId: selectedClientId,
+        chatId,
+        text: selectedMessage.text,
+        media,
+        options: media && selectedMessage.text.trim() ? { caption: selectedMessage.text } : {},
       });
 
-      const deliveryTime = Date.now() - attemptStart;
+      const deliveryTime = measuredDeliveryTime || (Date.now() - attemptStart);
       campaign.successCount += 1;
       campaign.processedNumbers += 1;
       campaign.currentIndex += 1;
