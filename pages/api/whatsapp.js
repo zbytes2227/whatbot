@@ -1,4 +1,4 @@
-import { clients, initClient, toggleClient, updateClientStatus } from '@/lib/whatsappClients';
+import { clients, startClient, toggleClient, logoutClient } from '@/lib/whatsappClients';
 import { verifyAuth } from '@/lib/auth';
 import { createLogger, getRecentLogs, getRequestContext } from '@/lib/logger';
 
@@ -87,7 +87,7 @@ export default async function handler(req, res) {
         }
 
         if (!client.client || ['error', 'disconnected'].includes(client.status)) {
-          await initClient(clientId, client, { trigger: 'api_qr_request' });
+          await startClient(clientId, client, { trigger: 'api_qr_request' });
           await waitForQRCodeOrReady(clientId, 12000);
         } else if (client.status === 'reconnecting') {
           await waitForQRCodeOrReady(clientId, 5000);
@@ -146,34 +146,7 @@ export default async function handler(req, res) {
         if (!client.client) {
           return res.status(400).json({ success: false, msg: 'Client not initialized or already logged out' });
         }
-
-        try {
-          await client.client.logout();
-        } catch (err) {
-          logger.warn('Logout call failed, proceeding with local cleanup', { clientId, err });
-        }
-
-        try {
-          await client.client.destroy();
-        } catch (err) {
-          logger.warn('Destroy after logout failed', { clientId, err });
-        }
-
-        client.client = null;
-        client.qrCode = null;
-        client.ready = false;
-        client.error = null;
-        client.accountInfo = null;
-        client.reconnectAttempts = 0;
-        client.initInProgress = false;
-        client.initPromise = null;
-
-        updateClientStatus(clientId, client, {
-          status: 'disconnected',
-          error: null,
-          qrCode: null,
-          ready: false,
-        });
+        await logoutClient(clientId);
 
         logger.info('Client logged out', { clientId });
         return res.status(200).json({ success: true, msg: `${clientId} logged out successfully` });
@@ -193,7 +166,7 @@ export default async function handler(req, res) {
         // initClient owns the single-flight destroy/recreate sequence. Manual
         // state clearing here can race initialize() and launch a second browser.
         client.reconnectAttempts = 0;
-        await initClient(clientId, client, { forceReinit: true, trigger: 'api_restart' });
+        await startClient(clientId, client, { forceReinit: true, trigger: 'api_restart' });
 
         logger.info('Client restart initiated', { clientId });
         return res.status(200).json({

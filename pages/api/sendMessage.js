@@ -1,4 +1,4 @@
-import { clients } from '@/lib/whatsappClients';
+import { clients, enqueueClientOperation, withTimeout, OPERATION_TIMEOUT_MS } from '@/lib/whatsappClients';
 import MessageHistory from '@/models/MessageHistory';
 import connectToMongoDB from '@/lib/mongodb';
 import { createLogger, getRequestContext } from '@/lib/logger';
@@ -93,22 +93,23 @@ export default async function handler(req, res) {
     const savedHistory = await messageHistory.save();
     messageHistoryId = savedHistory._id;
 
+    const selectedEntry = clients[selectedClientId];
+    const selectedGeneration = selectedEntry.generation;
     const chatId = `${formattedNumber}@c.us`;
-    const isRegistered = await selectedClient.isRegisteredUser(chatId);
+    let deliveryTime = 0;
+    await enqueueClientOperation(selectedClientId, selectedEntry, async () => {
+      if (!selectedEntry.ready || selectedEntry.client !== selectedClient || selectedEntry.generation !== selectedGeneration) {
+        throw new Error('WhatsApp client changed state while preparing the message');
+      }
+      const isRegistered = await withTimeout(selectedClient.isRegisteredUser(chatId), OPERATION_TIMEOUT_MS, 'WhatsApp number lookup');
 
-    if (!isRegistered) {
-      await MessageHistory.findByIdAndUpdate(messageHistoryId, { deliveryStatus: 'failed' });
-      logger.warn('Send aborted: number not registered on WhatsApp', { formattedNumber, clientId: selectedClientId });
-      return res.status(400).json({ success: false, msg: 'This number is not registered on WhatsApp' });
-    }
+      if (!isRegistered) throw new Error('This number is not registered on WhatsApp');
 
-    const startTime = Date.now();
-    await selectedClient.sendMessage(chatId, msg.trim());
-    const deliveryTime = Date.now() - startTime;
+      const startTime = Date.now();
+      await withTimeout(selectedClient.sendMessage(chatId, msg.trim()), OPERATION_TIMEOUT_MS, 'WhatsApp message send');
+      deliveryTime = Date.now() - startTime;
 
-    await MessageHistory.findByIdAndUpdate(messageHistoryId, {
-      deliveryStatus: 'sent',
-      deliveryTime,
+      await MessageHistory.findByIdAndUpdate(messageHistoryId, { deliveryStatus: 'sent', deliveryTime });
     });
 
     logger.info('Message sent successfully', {

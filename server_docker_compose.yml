@@ -20,6 +20,9 @@ services:
       - JWT_TOKEN_ADMIN=Op7Xactr@5fs
       - JWT_TOKEN_STAFF=njjsPP028jSH
       - TOKEN_API_PUBLIC=TANUTOKEN@CLIENT15000
-      
- 
- 
+      - WHATSAPP_SESSION_PATH=/usr/src/app/whatsapp-sessions
+      - WHATSAPP_BOOT_RESTORE_CONCURRENCY=1
+
+    volumes:
+      - ./whatsapp-sessions:/usr/src/app/whatsapp-sessions
+      - ./logs:/usr/src/app/logs

@@ -8,6 +8,8 @@ services:
       - "3000:3000"
     env_file: 
       - ./.env.production
+    environment:
+      WHATSAPP_SESSION_PATH: /usr/src/app/whatsapp-sessions
     volumes:
       - ./whatsapp-sessions:/usr/src/app/whatsapp-sessions
       - ./logs:/usr/src/app/logs
