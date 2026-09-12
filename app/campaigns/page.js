@@ -177,10 +177,37 @@ function CampaignForm({
   onClose,
   submitLabel,
 }) {
+  const isFormDirty = () => {
+    if (formData.campaignName.trim()) return true;
+    if (formData.contactList) return true;
+    if (formData.messages.some((m) => m && m.trim())) return true;
+    if (formData.selectedClients.length > 0) return true;
+    if (mediaFiles.some((f) => f !== null)) return true;
+    return false;
+  };
+
+  const handleRequestClose = () => {
+    if (isFormDirty()) {
+      const confirmDiscard = window.confirm('You have unsaved campaign details. Are you sure you want to exit and discard your changes?');
+      if (!confirmDiscard) return;
+    }
+    onClose();
+  };
+
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        handleRequestClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [formData, mediaFiles]);
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-end justify-center bg-zinc-900/40 backdrop-blur-sm sm:items-center"
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      onClick={(e) => { if (e.target === e.currentTarget) handleRequestClose(); }}
     >
       <div className="max-h-[95vh] w-full max-w-2xl overflow-y-auto rounded-t-2xl border border-zinc-200 bg-white shadow-2xl sm:rounded-2xl">
         {/* Header */}
@@ -190,7 +217,8 @@ function CampaignForm({
             <p className="text-xs text-zinc-500">Configure your campaign message variants, media, and delivery schedule.</p>
           </div>
           <button
-            onClick={onClose}
+            type="button"
+            onClick={handleRequestClose}
             className="flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-100 hover:text-zinc-600"
           >
             <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -418,7 +446,7 @@ function CampaignForm({
           <div className="flex items-center justify-end gap-2 border-t border-zinc-100 pt-4">
             <button
               type="button"
-              onClick={onClose}
+              onClick={handleRequestClose}
               className="rounded-lg border border-zinc-200 px-4 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50"
             >
               Cancel
