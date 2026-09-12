@@ -23,7 +23,6 @@ services:
       - TOKEN_API_PUBLIC=TANUTOKEN@CLIENT15000
       - WHATSAPP_SESSION_PATH=/usr/src/app/whatsapp-sessions
       - WHATSAPP_BOOT_RESTORE_CONCURRENCY=1
-      - MAX_ACTIVE_WHATSAPP_BROWSERS=2
 
     volumes:
       - ./whatsapp-sessions:/usr/src/app/whatsapp-sessions

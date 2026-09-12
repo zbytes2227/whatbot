@@ -4,7 +4,6 @@ import { clients, sendWhatsAppMessage } from '@/lib/whatsappClients';
 import { verifyAuth } from '@/lib/auth';
 import formidable from 'formidable';
 import fs from 'fs';
-import { MessageMedia } from 'whatsapp-web.js';
 import connectToMongoDB from '@/lib/mongodb';
 import MessageHistory from '@/models/MessageHistory';
 import { createLogger } from '@/lib/logger';
@@ -337,7 +336,7 @@ async function runCampaign(campaignId, trigger = 'manual') {
     try {
       const chatId = `${item.formatted}@c.us`;
       const media = selectedMessage.hasMedia && selectedMessage.mediaData
-        ? new MessageMedia(selectedMessage.mediaType, selectedMessage.mediaData, selectedMessage.mediaName)
+        ? { data: selectedMessage.mediaData, type: selectedMessage.mediaType, name: selectedMessage.mediaName }
         : null;
       const { deliveryTime: measuredDeliveryTime } = await sendWhatsAppMessage({
         clientId: selectedClientId,

@@ -11,7 +11,6 @@ services:
       - ./.env.production
     environment:
       WHATSAPP_SESSION_PATH: /usr/src/app/whatsapp-sessions
-      MAX_ACTIVE_WHATSAPP_BROWSERS: 2
       WHATSAPP_BOOT_RESTORE_CONCURRENCY: 1
     volumes:
       - ./whatsapp-sessions:/usr/src/app/whatsapp-sessions

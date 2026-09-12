@@ -443,7 +443,7 @@ export default function WhatsAppPage() {
                     {new Date(log.timestamp || Date.now()).toLocaleTimeString()}
                   </span>
                   <span className="font-semibold text-red-600 shrink-0">[{log.level || 'ERROR'}]</span>
-                  <span className="text-zinc-800 break-all">{log.message || JSON.stringify(log)}</span>
+                  <span className="text-zinc-800 break-all">{formatLogMessage(log)}</span>
                 </div>
               ))}
             </div>
@@ -529,4 +529,10 @@ export default function WhatsAppPage() {
       </div>
     </Layout>
   );
+}
+
+function formatLogMessage(log) {
+  const message = log?.message ?? log;
+  if (typeof message === 'string') return message;
+  try { return JSON.stringify(message); } catch { return String(message); }
 }

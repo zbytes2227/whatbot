@@ -13,15 +13,8 @@ async function getUsableWhatsAppClient(clientId) {
   }
 
   try {
-    const state = await clientEntry.client.getState();
-    if (state !== 'CONNECTED') {
-      return {
-        ok: false,
-        status: 409,
-        msg: `Client ${clientId} is not usable yet (WhatsApp state: ${state || 'unknown'}). Please wait for Connected status.`,
-      };
-    }
-    return { ok: true, client: clientEntry.client, entry: clientEntry, state };
+    if (!clientEntry.ready) return { ok: false, status: 409, msg: `Client ${clientId} is not ready yet` };
+    return { ok: true, client: clientEntry.client, entry: clientEntry, state: 'CONNECTED' };
   } catch (error) {
     return {
       ok: false,
@@ -53,42 +46,13 @@ async function waitForUsableWhatsAppClient(clientId, timeoutMs = 15000) {
   };
 }
 
-async function getGroupsFromWeb(client, clientId) {
-  // whatsapp-web.js 1.34.7's getChats() serializes every chat through a
-  // private WhatsApp-Web model helper. On some current Web builds that
-  // helper throws the minified `r` error even though the session is healthy.
-  // Read only the stable group fields directly from the live collection and
-  // avoid the failing full-chat serializer.
-  let lastError;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      return await client.pupPage.evaluate(() => {
-        const collection = window.require('WAWebCollections').Chat;
-        return collection.getModelsArray()
-          .filter((chat) => chat.isGroup)
-          .map((chat) => ({
-            id: { _serialized: chat.id?._serialized || String(chat.id) },
-            name: chat.formattedTitle || chat.name || '',
-            description: chat.groupMetadata?.description || '',
-            participants: chat.groupMetadata?.participants
-              ? chat.groupMetadata.participants.getModelsArray().map((participant) => ({
-                  id: { _serialized: participant.id?._serialized || String(participant.id) },
-                  isAdmin: !!participant.isAdmin,
-                  isSuperAdmin: !!participant.isSuperAdmin,
-                }))
-              : [],
-            createdAt: chat.t,
-            lastMessage: chat.lastReceivedKey ? null : null,
-          }));
-      });
-    } catch (error) {
-      lastError = error;
-      if (attempt < 2) {
-        await wait(400);
-      }
-    }
-  }
-  throw new Error(`WhatsApp group collection unavailable for ${clientId}: ${lastError?.message || 'unknown session error'}`);
+async function getGroupsFromWeb(client) {
+  const groups = await client.groupFetchAllParticipating();
+  return Object.values(groups).map((group) => ({
+    id: { _serialized: group.id }, name: group.subject || '', description: group.desc || '',
+    participants: (group.participants || []).map((p) => ({ id: { _serialized: p.id }, isAdmin: ['admin', 'superadmin'].includes(p.admin), isSuperAdmin: p.admin === 'superadmin' })),
+    createdAt: group.creation ? new Date(group.creation * 1000) : null, lastMessage: null,
+  }));
 }
 
 export default async function handler(req, res) {
@@ -134,8 +98,7 @@ export default async function handler(req, res) {
         if (client.ready && client.client) {
           try {
             // Get basic info about the client
-            const clientInfo = await client.client.getState();
-            if (clientInfo !== 'CONNECTED') continue;
+            const clientInfo = 'CONNECTED';
             availableProfiles.push({
               clientId: id,
               name: client.name,
@@ -248,9 +211,8 @@ export default async function handler(req, res) {
 
       try {
         // Get the specific chat by ID
-        const chat = await client.getChatById(groupId);
-        
-        if (!chat.isGroup) {
+        const chat = await client.groupMetadata(groupId);
+        if (!chat?.id) {
           return res.status(400).json({
             success: false,
             msg: 'Provided ID is not a group'
@@ -259,36 +221,33 @@ export default async function handler(req, res) {
 
         // Extract participant details
         const participants = await Promise.all(
-          chat.participants.map(async (participant) => {
+          (chat.participants || []).map(async (participant) => {
             try {
               // Get contact info for each participant
-              const contact = await client.getContactById(participant.id._serialized);
-              
-              // Extract phone number from WhatsApp ID
-              const phoneNumber = participant.id.user;
+              const phoneNumber = participant.id.split('@')[0];
               
               return {
-                id: participant.id._serialized,
-                phoneNumber: phoneNumber,
-                formattedNumber: formatPhoneNumber(phoneNumber),
-                name: contact.name || contact.pushname || phoneNumber,
-                isAdmin: participant.isAdmin,
-                isSuperAdmin: participant.isSuperAdmin,
-                profilePicUrl: null, // We'll skip profile pic for performance
-                status: contact.statusMessage || '',
-                isMe: participant.id._serialized === client.info?.wid?._serialized,
-                isContact: contact.isMyContact
-              };
-            } catch (error) {
-              console.error(`Error processing participant ${participant.id._serialized}:`, error);
-              const phoneNumber = participant.id.user;
-              return {
-                id: participant.id._serialized,
+                id: participant.id,
                 phoneNumber: phoneNumber,
                 formattedNumber: formatPhoneNumber(phoneNumber),
                 name: phoneNumber,
-                isAdmin: participant.isAdmin,
-                isSuperAdmin: participant.isSuperAdmin,
+                isAdmin: ['admin', 'superadmin'].includes(participant.admin),
+                isSuperAdmin: participant.admin === 'superadmin',
+                profilePicUrl: null, // We'll skip profile pic for performance
+                status: '',
+                isMe: participant.id === client.user?.id,
+                isContact: false
+              };
+            } catch (error) {
+              console.error(`Error processing participant ${participant.id}:`, error);
+              const phoneNumber = participant.id.split('@')[0];
+              return {
+                id: participant.id,
+                phoneNumber: phoneNumber,
+                formattedNumber: formatPhoneNumber(phoneNumber),
+                name: phoneNumber,
+                isAdmin: ['admin', 'superadmin'].includes(participant.admin),
+                isSuperAdmin: participant.admin === 'superadmin',
                 profilePicUrl: null,
                 status: '',
                 isMe: false,
@@ -307,11 +266,11 @@ export default async function handler(req, res) {
           clientId,
           clientName: clients[clientId].name,
           groupInfo: {
-            groupId: chat.id._serialized,
-            name: chat.name,
-            description: chat.description || '',
+            groupId: chat.id,
+            name: chat.subject || '',
+            description: chat.desc || '',
             participantCount: participants.length,
-            createdAt: chat.createdAt
+            createdAt: chat.creation ? new Date(chat.creation * 1000) : null
           },
           participants,
           phoneNumbers: validPhoneNumbers,
@@ -321,7 +280,7 @@ export default async function handler(req, res) {
             admins: participants.filter(p => p.isAdmin).length,
             contacts: participants.filter(p => p.isContact).length
           },
-          msg: `Extracted ${validPhoneNumbers.length} valid phone numbers from group "${chat.name}"`
+          msg: `Extracted ${validPhoneNumbers.length} valid phone numbers from group "${chat.subject || ''}"`
         });
 
       } catch (error) {
