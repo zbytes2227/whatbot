@@ -140,7 +140,7 @@ export default function Layout({ children }) {
                 <p className="text-xs font-semibold text-emerald-950">WhatsApp Automation</p>
               </div>
               <p className="mt-1 text-[11px] text-zinc-500 leading-relaxed">
-                Background campaign runner & message sync active.
+                Background campaign runner & message sync active. V3
               </p>
             </div>
           </div>
