@@ -10,6 +10,8 @@
 !.yarn/releases
 !.yarn/versions
 
+
+
 # testing
 /coverage
 
@@ -19,6 +21,7 @@
 
 /.wwebjs_auth/
 /.wwebjs_cache/
+/.baileys_auth/
 
 # production
 /build
