@@ -2,7 +2,10 @@
 
 WhatBot is a powerful web-based application built with Next.js and MongoDB that allows users to manage and run automated WhatsApp messaging campaigns. It utilizes `@whiskeysockets/baileys` to connect to multiple WhatsApp accounts simultaneously and provides a comprehensive dashboard to track campaign progress, message delivery, and contacts.
 
-## 🚀 Features
+<img width="1920" height="1080" alt="1" src="https://github.com/user-attachments/assets/58d5d7fe-1716-4d86-a140-b035d47a807d" />
+
+
+## Features
 
 - **Multi-Account Support:** Connect and manage multiple WhatsApp accounts (up to 4 profiles) simultaneously by scanning QR codes directly from the dashboard.
 - **Advanced Campaign Management:** Create and schedule campaigns with multiple messages in sequence.
@@ -29,6 +32,11 @@ WhatBot is a powerful web-based application built with Next.js and MongoDB that 
 - `/lib`: Core backend utilities, including the WhatsApp client manager (`whatsappClients.js`), MongoDB connection (`mongodb.js`), and logging (`logger.js`).
 - `/models`: Mongoose database schemas (`Campaigns.js`, `ContactList.js`, `MessageHistory.js`).
 - `/.baileys_auth`: Local storage directory for WhatsApp session state (auto-generated, git-ignored).
+
+
+<img width="1920" height="1080" alt="2" src="https://github.com/user-attachments/assets/a0d740be-9857-42a2-a764-32e29325d7fa" />
+
+
 
 ## 💻 Getting Started
 
