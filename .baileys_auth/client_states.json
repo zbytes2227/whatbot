@@ -12,8 +12,8 @@
       "number": "917800010036",
       "me": true
     },
-    "status": "ready",
-    "ready": true
+    "status": "disconnected",
+    "ready": false
   },
   "client3": {
     "enabled": false,

@@ -1,36 +1,75 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://github.com/vercel/next.js/tree/canary/packages/create-next-app).
+# WhatMot - WhatsApp Campaign Manager
 
-## Getting Started
+WhatMot is a powerful web-based application built with Next.js and MongoDB that allows users to manage and run automated WhatsApp messaging campaigns. It utilizes `@whiskeysockets/baileys` to connect to multiple WhatsApp accounts simultaneously and provides a comprehensive dashboard to track campaign progress, message delivery, and contacts.
 
-First, run the development server:
+## 🚀 Features
+
+- **Multi-Account Support:** Connect and manage multiple WhatsApp accounts (up to 4 profiles) simultaneously by scanning QR codes directly from the dashboard.
+- **Advanced Campaign Management:** Create and schedule campaigns with multiple messages in sequence.
+- **Media Support:** Send text, images, videos, and documents seamlessly.
+- **Intelligent Scheduling:** Set specific start and end times for campaigns in a designated timezone. The system automatically pauses campaigns at the end time and resumes them the next day.
+- **Anti-Ban Features:** Configure randomized minimum and maximum delays between messages to mimic human behavior and reduce the risk of account bans.
+- **Contact Management:** Upload and manage bulk contact lists (CSV support).
+- **Live Reporting & Analytics:** Track real-time delivery status, success rates, failed messages, and average delivery times.
+- **Secure Authentication:** Built-in user authentication using JWT and robust password hashing (Argon2/bcrypt).
+- **Docker Ready:** Includes `Dockerfile` and `docker-compose` setups for straightforward deployment.
+
+## 🛠 Tech Stack
+
+- **Frontend:** Next.js (App Router), React, Tailwind CSS, Lucide Icons
+- **Backend:** Next.js API Routes, Node.js
+- **Database:** MongoDB (Mongoose schemas)
+- **WhatsApp Integration:** `@whiskeysockets/baileys`
+- **Authentication:** JWT, Argon2, bcrypt
+
+## 📂 Project Structure
+
+- `/app`: Next.js frontend pages, layout, and UI components.
+- `/pages/api`: Backend API endpoints (auth, campaigns, contacts, whatsapp logic).
+- `/lib`: Core backend utilities, including the WhatsApp client manager (`whatsappClients.js`), MongoDB connection (`mongodb.js`), and logging (`logger.js`).
+- `/models`: Mongoose database schemas (`Campaigns.js`, `ContactList.js`, `MessageHistory.js`).
+- `/.baileys_auth`: Local storage directory for WhatsApp session state (auto-generated, git-ignored).
+
+## 💻 Getting Started
+
+### Prerequisites
+- Node.js (v18+)
+- MongoDB instance (local or Atlas)
+- Docker (optional, for containerized deployment)
+
+### Local Development
+
+1. Clone the repository and navigate to the project folder:
+   ```bash
+   cd whatmot
+   ```
+
+2. Copy the example environment file:
+   ```bash
+   cp .env.example .env.local
+   ```
+   *Edit `.env.local` to include your MongoDB URI and a secure JWT secret.*
+
+3. Install dependencies:
+   ```bash
+   npm install
+   ```
+
+4. Start the development server:
+   ```bash
+   npm run dev
+   ```
+
+5. Open [http://localhost:3000](http://localhost:3000) in your browser.
+
+### Docker Deployment
+
+To run the application using Docker, ensure your `.env.local` is configured, then run:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+docker-compose -f server_docker_compose.yml up -d --build
 ```
+This will spin up the Next.js application container with the appropriate volumes for session storage.
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.js`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## ⚠️ Important Note on Session Storage
+WhatsApp session files are stored in the `.baileys_auth` directory. When deploying (especially with Docker), ensure this directory is mounted as a persistent volume so you do not have to re-scan the QR codes every time the container restarts.
