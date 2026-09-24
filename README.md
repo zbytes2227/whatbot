@@ -1,6 +1,6 @@
-# WhatMot - WhatsApp Campaign Manager
+# WhatBot - WhatsApp Campaign Manager
 
-WhatMot is a powerful web-based application built with Next.js and MongoDB that allows users to manage and run automated WhatsApp messaging campaigns. It utilizes `@whiskeysockets/baileys` to connect to multiple WhatsApp accounts simultaneously and provides a comprehensive dashboard to track campaign progress, message delivery, and contacts.
+WhatBot is a powerful web-based application built with Next.js and MongoDB that allows users to manage and run automated WhatsApp messaging campaigns. It utilizes `@whiskeysockets/baileys` to connect to multiple WhatsApp accounts simultaneously and provides a comprehensive dashboard to track campaign progress, message delivery, and contacts.
 
 ## 🚀 Features
 

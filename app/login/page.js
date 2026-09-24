@@ -1,6 +1,7 @@
 'use client';
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
+import Image from 'next/image';
 import axios from 'axios';
 import { toast, ToastContainer } from 'react-toastify';
 import { Eye, EyeOff, LogIn } from 'lucide-react';
@@ -71,7 +72,7 @@ export default function LoginPage() {
 
       <div className={`login-card ${mounted ? 'login-card--visible' : ''}`}>
         <div className="login-mark">
-          <span className="login-mark__icon">W</span>
+          <Image src="/logo.png" alt="WhatBot" width={64} height={64} className="login-mark__icon object-cover" priority />
         </div>
 
         <h1 className="login-title">Sign in</h1>

@@ -12,7 +12,12 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata = {
-  title: 'My WhatBot',
+  title: 'WhatBot',
+  icons: {
+    icon: '/favicon.ico',
+    shortcut: '/favicon.ico',
+    apple: '/logo.png',
+  },
   robots: {
     index: false,
     follow: false,
@@ -23,8 +28,8 @@ export const metadata = {
       noimageindex: true,
     },
   },
-  description: "Automatio Tool"
-}
+  description: "WhatsApp automation dashboard"
+};
 
 export default function RootLayout({ children }) {
   return (

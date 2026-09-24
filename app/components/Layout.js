@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import Link from 'next/link';
+import Image from 'next/image';
 import { usePathname } from 'next/navigation';
 import {
   LayoutDashboard,
@@ -79,10 +80,8 @@ export default function Layout({ children }) {
               {/* Mobile header */}
               <div className="mb-4 flex items-center justify-between lg:hidden">
                 <div className="flex items-center gap-2">
-                  <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-600 text-white shadow-xs">
-                    <Activity className="h-4 w-4" />
-                  </div>
-                  <span className="text-sm font-bold text-zinc-900">WhatMot</span>
+                  <Image src="/logo.png" alt="WhatBot" width={28} height={28} className="rounded-lg object-cover" priority />
+                  <span className="text-sm font-bold text-zinc-900">WhatBot</span>
                 </div>
                 <button
                   className="flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"

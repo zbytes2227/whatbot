@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
+import Image from 'next/image';
 import {
   Menu,
   ChevronDown,
@@ -94,10 +95,8 @@ export default function Navbar({ sidebarOpen, setSidebarOpen }) {
 
           {/* Logo mark (desktop only) */}
           <div className="hidden items-center gap-2 lg:flex">
-            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-600 text-white shadow-sm">
-              <Activity className="h-4 w-4" />
-            </div>
-            <span className="text-sm font-semibold tracking-tight text-zinc-900">WhatMot</span>
+            <Image src="/logo.png" alt="WhatBot" width={28} height={28} className="rounded-lg object-cover" priority />
+            <span className="text-sm font-semibold tracking-tight text-zinc-900">WhatBot</span>
             <span className="text-zinc-300">/</span>
           </div>
 
@@ -151,7 +150,7 @@ export default function Navbar({ sidebarOpen, setSidebarOpen }) {
                     <Shield className="h-3.5 w-3.5 text-emerald-600" />
                     <p className="text-xs font-semibold text-zinc-900">Administrator</p>
                   </div>
-                  <p className="mt-0.5 text-[11px] text-zinc-500">WhatMot Production</p>
+                  <p className="mt-0.5 text-[11px] text-zinc-500">WhatBot Production</p>
                 </div>
                 <div className="p-1">
                   <button

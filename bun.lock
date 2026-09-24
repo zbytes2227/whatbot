@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "whatmot",
+      "name": "whatbot",
       "dependencies": {
         "argon2": "^0.43.1",
         "axios": "^1.11.0",
