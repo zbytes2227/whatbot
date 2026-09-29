@@ -31,4 +31,7 @@ const MessageHistorySchema = new mongoose.Schema({
   sentTime: { type: Date, default: Date.now }
 }, { timestamps: true });
 
+MessageHistorySchema.index({ sentTime: -1 });
+MessageHistorySchema.index({ campaignId: 1, sentTime: -1 });
+
 export default mongoose.models.MessageHistory || mongoose.model('MessageHistory', MessageHistorySchema);

@@ -150,7 +150,20 @@ async function queueCampaignRun(campaignId, trigger = 'manual') {
       await runCampaign(campaignId, trigger);
     } catch (err) {
       logger.error('Campaign run crashed', { campaignId, trigger, err });
-      await Campaign.findOneAndUpdate({ campaignId }, { status: 'error' }).catch(() => {});
+      const recovered = await Campaign.findOneAndUpdate(
+        { campaignId, status: { $in: ['pending', 'running'] } },
+        { $set: { status: 'running', lastError: err.message } },
+        { new: true }
+      ).catch((updateError) => {
+        logger.error('Could not recover crashed campaign', { campaignId, err: updateError });
+        return null;
+      });
+      if (recovered) {
+        const retryTimer = setTimeout(() => queueCampaignRun(campaignId, 'error_recovery').catch((retryError) => {
+          logger.error('Campaign recovery queue failed', { campaignId, err: retryError });
+        }), 30000);
+        retryTimer.unref?.();
+      }
     } finally {
       runningSet.delete(campaignId);
     }
@@ -242,12 +255,12 @@ async function runCampaign(campaignId, trigger = 'manual') {
 
     const clientIds = getReadyCampaignClientIds(campaign.selectedClients || []);
     if (!clientIds.length) {
-      logger.warn('No ready clients available for campaign', { campaignId });
-      campaign.status = 'paused';
-      campaign.lastPausedAt = new Date();
-      campaign.nextResumeAt = new Date(Date.now() + 5 * 60 * 1000);
+      logger.warn('No ready clients available; retrying without pausing campaign', { campaignId });
+      campaign.status = 'running';
+      campaign.lastError = 'Waiting for a selected WhatsApp client to reconnect';
       await campaign.save();
-      return;
+      await new Promise((resolve) => setTimeout(resolve, 30000));
+      continue;
     }
 
     if (!isWithinSendingHours(campaign.scheduling)) {

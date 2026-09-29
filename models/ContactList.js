@@ -6,5 +6,6 @@ const ContactListSchema = new mongoose.Schema({
   description: { type: String },
   contacts: [String],  
 }, { timestamps: true });
+ContactListSchema.index({ userId: 1, createdAt: -1 });
 // done
 export default mongoose.models.ContactList || mongoose.model('ContactList', ContactListSchema);
