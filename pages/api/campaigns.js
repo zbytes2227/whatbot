@@ -58,20 +58,52 @@ function generateCampaignId() {
   return `campaign_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 }
 
-function isWithinSendingHours(scheduling) {
-  if (!scheduling?.startTime || !scheduling?.endTime) return true;
-  const now = new Date();
-  const currentTime = now.toTimeString().slice(0, 5);
-  return currentTime >= scheduling.startTime && currentTime <= scheduling.endTime;
+const DEFAULT_CAMPAIGN_TIMEZONE = 'Asia/Kolkata';
+
+function getCampaignTimeParts(date = new Date(), timeZone = DEFAULT_CAMPAIGN_TIMEZONE) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.filter(({ type }) => type !== 'literal').map(({ type, value }) => [type, value]));
+  return { year: Number(values.year), month: Number(values.month), day: Number(values.day), hour: Number(values.hour), minute: Number(values.minute) };
 }
 
-function getNextResumeTime(scheduling) {
-  if (!scheduling?.resumeNextDay) return null;
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  const [hours, minutes] = (scheduling.startTime || '07:00').split(':');
-  tomorrow.setHours(parseInt(hours, 10), parseInt(minutes, 10), 0, 0);
-  return tomorrow;
+function getMinutesSinceMidnight(value) {
+  const [hours, minutes] = String(value || '00:00').split(':').map(Number);
+  return (Number.isFinite(hours) ? hours : 0) * 60 + (Number.isFinite(minutes) ? minutes : 0);
+}
+
+function getTimeZoneDate(localDate, timeZone, dayOffset = 0) {
+  const utcGuess = Date.UTC(localDate.year, localDate.month - 1, localDate.day + dayOffset, localDate.hour, localDate.minute);
+  const zoned = getCampaignTimeParts(new Date(utcGuess), timeZone);
+  const zonedAsUtc = Date.UTC(zoned.year, zoned.month - 1, zoned.day, zoned.hour, zoned.minute);
+  return new Date(utcGuess - (zonedAsUtc - utcGuess));
+}
+
+function isWithinSendingHours(scheduling, now = new Date()) {
+  if (!scheduling?.startTime || !scheduling?.endTime) return true;
+  const current = getCampaignTimeParts(now, scheduling.timezone || DEFAULT_CAMPAIGN_TIMEZONE);
+  const currentMinutes = current.hour * 60 + current.minute;
+  const startMinutes = getMinutesSinceMidnight(scheduling.startTime);
+  const endMinutes = getMinutesSinceMidnight(scheduling.endTime);
+  return startMinutes <= endMinutes
+    ? currentMinutes >= startMinutes && currentMinutes <= endMinutes
+    : currentMinutes >= startMinutes || currentMinutes <= endMinutes;
+}
+
+function getNextResumeTime(scheduling, now = new Date()) {
+  if (!scheduling?.resumeNextDay || !scheduling?.startTime) return null;
+  const timeZone = scheduling.timezone || DEFAULT_CAMPAIGN_TIMEZONE;
+  const current = getCampaignTimeParts(now, timeZone);
+  const currentMinutes = current.hour * 60 + current.minute;
+  const startMinutes = getMinutesSinceMidnight(scheduling.startTime);
+  const endMinutes = getMinutesSinceMidnight(scheduling.endTime || scheduling.startTime);
+  const overnight = startMinutes > endMinutes;
+  const startsLaterToday = !overnight && currentMinutes < startMinutes;
+  const dayOffset = startsLaterToday || (overnight && currentMinutes < startMinutes) ? 0 : 1;
+  const [hour, minute] = String(scheduling.startTime).split(':').map(Number);
+  return getTimeZoneDate({ ...current, hour, minute }, timeZone, dayOffset);
 }
 
 function getCampaignScheduledDateTime(campaign) {

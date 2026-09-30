@@ -32,6 +32,8 @@ COPY --from=build /usr/src/app/.next/static ./.next/static
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
 
 RUN mkdir -p /usr/src/app/whatsapp-sessions /usr/src/app/logs \
+  && mkdir -p /usr/src/app/.next/cache \
+  && chown -R node:node /usr/src/app/.next /usr/src/app/whatsapp-sessions /usr/src/app/logs \
   && chmod +x /usr/src/app/docker-entrypoint.sh
 
 USER root
