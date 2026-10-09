@@ -81,6 +81,10 @@ export default function WhatsAppPage() {
       const data = await res.json();
       if (!res.ok || !data.success || !data.clients) throw new Error(data.msg || 'Failed to load status');
       setClientsStatus(data.clients);
+      const qrReadyClient = Object.entries(data.clients).find(
+        ([, client]) => client.status === 'qr_ready' && client.qrCode
+      );
+      if (qrReadyClient && !qrClientId) setQrClientId(qrReadyClient[0]);
       setError('');
     } catch (err) {
       setError(err.message || 'Network error');
