@@ -43,6 +43,8 @@ const campaignSchema = new mongoose.Schema({
   lastPausedAt: { type: Date },
   nextResumeAt: { type: Date },
   lastError: { type: String },
+  runnerLeaseId: { type: String },
+  runnerLeaseExpiresAt: { type: Date },
   
   // Progress tracking
   totalNumbers: { type: Number, default: 0 },
@@ -78,5 +80,6 @@ const campaignSchema = new mongoose.Schema({
 
 campaignSchema.index({ userId: 1, createdAt: -1 });
 campaignSchema.index({ status: 1, nextResumeAt: 1 });
+campaignSchema.index({ status: 1, runnerLeaseExpiresAt: 1 });
 
 export default mongoose.models.Campaign || mongoose.model('Campaign', campaignSchema);

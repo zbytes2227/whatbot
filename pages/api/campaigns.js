@@ -7,6 +7,7 @@ import fs from 'fs';
 import connectToMongoDB from '@/lib/mongodb';
 import MessageHistory from '@/models/MessageHistory';
 import { createLogger } from '@/lib/logger';
+import { randomUUID } from 'crypto';
 
 const logger = createLogger({ module: 'api.campaigns' });
 
@@ -20,6 +21,8 @@ export const config = {
 const SCHEDULER_KEY = '__whatmot_campaign_scheduler';
 const RUNNING_KEY = '__whatmot_campaign_running_set';
 const TICK_KEY = '__whatmot_campaign_scheduler_tick_active';
+const RUNNER_LEASE_MS = 90000;
+const MONGO_RETRY_LIMIT = 3;
 
 if (!global[SCHEDULER_KEY]) {
   global[SCHEDULER_KEY] = { started: false, timer: null };
@@ -168,6 +171,69 @@ function getReadyCampaignClientIds(selectedClients = []) {
   });
 }
 
+function isTransientMongoError(error) {
+  const text = `${error?.name || ''} ${error?.message || ''}`.toLowerCase();
+  return error?.name === 'MongoServerSelectionError'
+    || error?.name === 'MongoNetworkError'
+    || error?.name === 'MongooseServerSelectionError'
+    || /timed out|timeout|connection|socket|topology|network/.test(text);
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function withMongoRetry(operation, context = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= MONGO_RETRY_LIMIT; attempt += 1) {
+    try {
+      await connectToMongoDB();
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientMongoError(error) || attempt === MONGO_RETRY_LIMIT) break;
+      const backoffMs = 250 * (2 ** (attempt - 1));
+      logger.warn('Transient MongoDB operation failed; retrying', { ...context, attempt, backoffMs, err: error });
+      await sleep(backoffMs);
+    }
+  }
+  logger.error('MongoDB operation exhausted retries', { ...context, err: lastError });
+  throw lastError;
+}
+
+async function acquireRunnerLease(campaignId, leaseId) {
+  const now = new Date();
+  const lease = await withMongoRetry(() => Campaign.findOneAndUpdate(
+    {
+      campaignId,
+      status: { $in: ['pending', 'running'] },
+      $or: [{ runnerLeaseId: null }, { runnerLeaseExpiresAt: null }, { runnerLeaseExpiresAt: { $lte: now } }],
+    },
+    { $set: { status: 'running', runnerLeaseId: leaseId, runnerLeaseExpiresAt: new Date(now.getTime() + RUNNER_LEASE_MS) } },
+    { new: true }
+  ), { campaignId, operation: 'acquire_runner_lease' });
+  if (!lease) {
+    logger.info('Campaign runner lease held by another live runner', { campaignId });
+    return false;
+  }
+  return true;
+}
+
+async function renewRunnerLease(campaignId, leaseId) {
+  const updated = await withMongoRetry(() => Campaign.updateOne(
+    { campaignId, runnerLeaseId: leaseId, status: 'running' },
+    { $set: { runnerLeaseExpiresAt: new Date(Date.now() + RUNNER_LEASE_MS) } }
+  ), { campaignId, operation: 'renew_runner_lease' });
+  if (!updated.modifiedCount) throw new Error('Campaign runner lease was lost');
+}
+
+async function releaseRunnerLease(campaignId, leaseId) {
+  await withMongoRetry(() => Campaign.updateOne(
+    { campaignId, runnerLeaseId: leaseId },
+    { $set: { runnerLeaseId: null, runnerLeaseExpiresAt: null } }
+  ), { campaignId, operation: 'release_runner_lease' }).catch((error) => {
+    logger.warn('Could not release runner lease; expiry will recover it', { campaignId, err: error });
+  });
+}
+
 async function queueCampaignRun(campaignId, trigger = 'manual') {
   const runningSet = global[RUNNING_KEY];
   if (runningSet.has(campaignId)) {
@@ -182,20 +248,7 @@ async function queueCampaignRun(campaignId, trigger = 'manual') {
       await runCampaign(campaignId, trigger);
     } catch (err) {
       logger.error('Campaign run crashed', { campaignId, trigger, err });
-      const recovered = await Campaign.findOneAndUpdate(
-        { campaignId, status: { $in: ['pending', 'running'] } },
-        { $set: { status: 'running', lastError: err.message } },
-        { new: true }
-      ).catch((updateError) => {
-        logger.error('Could not recover crashed campaign', { campaignId, err: updateError });
-        return null;
-      });
-      if (recovered) {
-        const retryTimer = setTimeout(() => queueCampaignRun(campaignId, 'error_recovery').catch((retryError) => {
-          logger.error('Campaign recovery queue failed', { campaignId, err: retryError });
-        }), 30000);
-        retryTimer.unref?.();
-      }
+      logger.warn('Runner will be rediscovered by the scheduler after crash; no unsafe resend is attempted', { campaignId });
     } finally {
       runningSet.delete(campaignId);
     }
@@ -242,6 +295,21 @@ async function ensureSchedulerRunning() {
       for (const campaign of pending) {
         await queueCampaignRun(campaign.campaignId, 'scheduler_pending');
       }
+
+      const orphaned = await Campaign.find({
+        status: 'running',
+        runnerLeaseExpiresAt: { $ne: null, $lte: now },
+      }).select('campaignId runnerLeaseExpiresAt').lean();
+      for (const campaign of orphaned) {
+        const reclaimed = await Campaign.updateOne(
+          { campaignId: campaign.campaignId, status: 'running', runnerLeaseExpiresAt: { $lte: now } },
+          { $set: { status: 'pending', runnerLeaseId: null, runnerLeaseExpiresAt: null, lastError: 'Runner lease expired; recovering campaign' } }
+        );
+        if (reclaimed.modifiedCount) {
+          logger.warn('Recovered orphaned campaign runner', { campaignId: campaign.campaignId });
+          await queueCampaignRun(campaign.campaignId, 'scheduler_orphan_recovery');
+        }
+      }
     } catch (err) {
       logger.error('Campaign scheduler tick failed', { err });
     } finally {
@@ -255,9 +323,13 @@ async function ensureSchedulerRunning() {
 
 async function runCampaign(campaignId, trigger = 'manual') {
   logger.info('Starting campaign runner', { campaignId, trigger });
+  const leaseId = randomUUID();
+  if (!await acquireRunnerLease(campaignId, leaseId)) return;
   let iteration = 0;
-  while (iteration < 5000) {
+  try {
+   while (iteration < 5000) {
     iteration += 1;
+    await renewRunnerLease(campaignId, leaseId);
     const campaign = await Campaign.findOne({ campaignId });
     if (!campaign) {
       logger.warn('Campaign not found during run', { campaignId });
@@ -360,6 +432,26 @@ async function runCampaign(campaignId, trigger = 'manual') {
 
     const messageIndex = Math.floor(Math.random() * campaign.messages.length);
     const selectedMessage = campaign.messages[messageIndex];
+    const existingIntent = await MessageHistory.findOne({
+      campaignId, number: item.formatted, source: 'campaign',
+      deliveryStatus: { $in: ['pending', 'unknown', 'delivered'] },
+    }).sort({ createdAt: -1 });
+    if (existingIntent) {
+      if (existingIntent.deliveryStatus !== 'delivered') {
+        campaign.status = 'error';
+        campaign.lastError = 'Message delivery outcome is uncertain; manual review required before resuming';
+        await campaign.save();
+        logger.error('Refusing to resend message with uncertain delivery outcome', { campaignId, number: item.formatted, deliveryStatus: existingIntent.deliveryStatus });
+        return;
+      }
+      campaign.successCount += 1;
+      campaign.processedNumbers += 1;
+      campaign.currentIndex += 1;
+      campaign.numberReports.push({ number: item.formatted, originalNumber: item.original, messageIndex: existingIntent.messageIndex ?? messageIndex, messageText: selectedMessage.text, status: 'success', client: existingIntent.clientUsed, timestamp: existingIntent.updatedAt || new Date(), deliveryTime: existingIntent.deliveryTime || 0, attemptNumber: 1 });
+      await campaign.save();
+      logger.info('Reconciled previously delivered message without resend', { campaignId, number: item.formatted });
+      continue;
+    }
     const attemptStart = Date.now();
 
     const messageHistory = new MessageHistory({
@@ -367,6 +459,7 @@ async function runCampaign(campaignId, trigger = 'manual') {
       number: item.formatted,
       originalNumber: item.original,
       message: selectedMessage.text,
+      messageIndex,
       deliveryStatus: 'pending',
       source: 'campaign',
       clientUsed: selectedClientId,
@@ -413,26 +506,14 @@ async function runCampaign(campaignId, trigger = 'manual') {
       await campaign.save();
     } catch (err) {
       const deliveryTime = Date.now() - attemptStart;
-      campaign.failedCount += 1;
-      campaign.processedNumbers += 1;
-      campaign.currentIndex += 1;
-      campaign.numberReports.push({
-        number: item.formatted,
-        originalNumber: item.original,
-        messageIndex,
-        messageText: selectedMessage.text,
-        status: 'failed',
-        client: selectedClientId,
-        timestamp: new Date(),
-        deliveryTime,
-        errorMessage: err.message,
-        attemptNumber: 1,
-      });
-
-      messageHistory.deliveryStatus = 'failed';
+      // A transport failure is not proof that WhatsApp did not accept the message.
+      // Persist uncertainty and stop; recovery must never blindly resend it.
+      messageHistory.deliveryStatus = 'unknown';
       messageHistory.deliveryTime = deliveryTime;
       messageHistory.error = err.message;
       await messageHistory.save();
+      campaign.status = 'error';
+      campaign.lastError = 'Message delivery outcome is uncertain; manual review required before resuming';
       await campaign.save();
 
       logger.error('Campaign message send failed', {
@@ -441,12 +522,16 @@ async function runCampaign(campaignId, trigger = 'manual') {
         clientId: selectedClientId,
         err,
       });
+      return;
     }
 
     const delayMs = getDelayMs(campaign.delaySettings);
     await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
   logger.warn('Campaign runner stopped after iteration cap', { campaignId, trigger, iteration });
+  } finally {
+    await releaseRunnerLease(campaignId, leaseId);
+  }
 }
 
 async function buildCampaignCsv(campaign, type = 'all') {

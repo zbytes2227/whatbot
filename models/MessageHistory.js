@@ -2,6 +2,8 @@
 import mongoose from 'mongoose';
 
 const MessageHistorySchema = new mongoose.Schema({
+  campaignId: { type: String, index: true },
+  messageIndex: { type: Number },
   number: { type: String, required: true },
   originalNumber: { type: String, required: true },      // As received before formatting
 
@@ -28,7 +30,8 @@ const MessageHistorySchema = new mongoose.Schema({
   mediaType: { type: String },
   mediaName: { type: String },
 
-  sentTime: { type: Date, default: Date.now }
+  sentTime: { type: Date, default: Date.now },
+  error: { type: String }
 }, { timestamps: true });
 
 MessageHistorySchema.index({ sentTime: -1 });
