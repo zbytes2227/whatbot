@@ -17,14 +17,21 @@ const handler = async (req, res) => {
     const trimmedUser = username.trim();
     const trimmedPass = password.trim();
 
-    const envUser = (process.env.ADMIN_USERNAME || 'Paradox').trim();
-    const envPass = (process.env.ADMIN_PASSWORD || 'Paradox').trim();
-    const jwtSecret = process.env.JWT_TOKEN_ADMIN || 'whatmot-super-secret-jwt-key-2026';
+    const envUser = process.env.ADMIN_USERNAME?.trim();
+    const envPass = process.env.ADMIN_PASSWORD?.trim();
+    const jwtSecret = process.env.JWT_TOKEN_ADMIN?.trim();
+
+    if (!envUser || !envPass || !jwtSecret) {
+      console.error('Login configuration is incomplete.');
+      return res.status(500).json({
+        success: false,
+        msg: 'Server authentication is not configured.',
+      });
+    }
 
     const isValid = (
       (trimmedUser.toLowerCase() === envUser.toLowerCase() && trimmedPass === envPass) ||
-      (trimmedUser.toLowerCase() === 'paradox' && trimmedPass === 'Paradox') ||
-      (trimmedUser.toLowerCase() === 'admin' && (trimmedPass === 'admin' || trimmedPass === envPass))
+      (trimmedUser.toLowerCase() === 'admin' && trimmedPass === envPass)
     );
 
     if (isValid) {
@@ -77,5 +84,4 @@ const handler = async (req, res) => {
 };
 
 export default handler;
-
 
