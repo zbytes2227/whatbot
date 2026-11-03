@@ -1,269 +1,129 @@
 'use client';
-import { useState, useEffect } from 'react';
-import { useRouter } from 'next/navigation';
+
+import { Suspense, useState } from 'react';
 import Image from 'next/image';
-import axios from 'axios';
-import { toast, ToastContainer } from 'react-toastify';
-import { Eye, EyeOff, LogIn } from 'lucide-react';
-import { saveAuthSession, authFetch } from '@/lib/clientApi';
-import 'react-toastify/dist/ReactToastify.css';
+import { useSearchParams } from 'next/navigation';
+import { AlertCircle, ArrowRight, BarChart3, Eye, EyeOff, Lock, ShieldCheck, User, Zap } from 'lucide-react';
+import { api } from '@/lib/clientApi';
+import { Button, cn } from '@/app/components/ui';
 
-export default function LoginPage() {
-  const [formData, setFormData] = useState({ username: '', password: '' });
+function safeNext(value) {
+  return typeof value === 'string' && value.startsWith('/') && !value.startsWith('//') && !value.startsWith('/login') ? value : '/';
+}
+
+function LoginForm() {
+  const params = useSearchParams();
+  const [form, setForm] = useState({ username: '', password: '' });
   const [showPassword, setShowPassword] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
-  const [mounted, setMounted] = useState(false);
-  const router = useRouter();
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [shake, setShake] = useState(false);
 
-  useEffect(() => {
-    setMounted(true);
-    // Check if session is already active
-    async function verifyExistingSession() {
-      try {
-        const res = await authFetch('/api/auth');
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.valid) {
-            router.replace('/');
-          }
-        }
-      } catch {}
-    }
-    verifyExistingSession();
-  }, [router]);
-
-  const handleInputChange = (e) => {
-    const { name, value } = e.target;
-    setFormData(prev => ({ ...prev, [name]: value }));
-  };
-
-  const handleSubmit = async (e) => {
+  const submit = async (e) => {
     e.preventDefault();
-    if (!formData.username || !formData.password) {
-      toast.error('Please fill in all fields');
+    if (!form.username.trim() || !form.password) {
+      setError('Enter your username and password.');
       return;
     }
-    setIsLoading(true);
+    setLoading(true);
+    setError('');
     try {
-      const response = await axios.post('/api/login', formData, {
-        headers: { 'Content-Type': 'application/json' },
-      });
-      if (response.data.success) {
-        toast.success('Signed in successfully');
-        saveAuthSession(response.data.token, response.data.user);
-        setTimeout(() => router.push('/'), 600);
-      }
-    } catch (error) {
-      toast.error(error.response?.data?.msg || 'Login failed. Please try again.');
-    } finally {
-      setIsLoading(false);
+      await api.post('/api/login', form);
+      window.location.assign(safeNext(params.get('next')));
+    } catch (err) {
+      setError(err.message);
+      setShake(true);
+      setTimeout(() => setShake(false), 500);
+      setLoading(false);
     }
   };
 
   return (
-    <div className="login-root">
-      <ToastContainer
-        position="top-right"
-        autoClose={3000}
-        hideProgressBar
-        closeOnClick
-        theme="light"
-      />
-
-      <div className={`login-card ${mounted ? 'login-card--visible' : ''}`}>
-        <div className="login-mark">
-          <Image src="/logo.png" alt="WhatBot" width={64} height={64} className="login-mark__icon object-cover" priority />
+    <form onSubmit={submit} className={cn('space-y-5', shake && 'animate-shake')} noValidate>
+      {error && (
+        <div className="flex animate-fade-in items-start gap-2.5 rounded-xl border border-red-200 bg-red-50 px-3.5 py-3 text-sm text-red-700 dark:border-red-500/20 dark:bg-red-500/10 dark:text-red-300" role="alert">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          {error}
         </div>
+      )}
 
-        <h1 className="login-title">Sign in</h1>
-        <p className="login-sub">Access your admin dashboard</p>
-
-        <form onSubmit={handleSubmit} className="login-form">
-          <div className="field">
-            <label htmlFor="username" className="field__label">Username</label>
-            <input
-              id="username"
-              name="username"
-              type="text"
-              autoComplete="username"
-              placeholder="Username (e.g. Paradox)"
-              value={formData.username}
-              onChange={handleInputChange}
-              disabled={isLoading}
-              required
-              className="field__input"
-            />
-          </div>
-
-          <div className="field">
-            <label htmlFor="password" className="field__label">Password</label>
-            <div className="field__password-wrap">
-              <input
-                id="password"
-                name="password"
-                type={showPassword ? 'text' : 'password'}
-                autoComplete="current-password"
-                placeholder="••••••••"
-                value={formData.password}
-                onChange={handleInputChange}
-                disabled={isLoading}
-                required
-                className="field__input field__input--password"
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword(v => !v)}
-                disabled={isLoading}
-                className="field__reveal"
-                aria-label={showPassword ? 'Hide password' : 'Show password'}
-              >
-                {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-              </button>
-            </div>
-          </div>
-
-          <button
-            type="submit"
-            disabled={isLoading}
-            className="btn-primary btn-primary--full"
-          >
-            {isLoading ? (
-              <span className="spinner" aria-hidden="true" />
-            ) : (
-              <LogIn size={15} />
-            )}
-            {isLoading ? 'Signing in…' : 'Sign in'}
-          </button>
-        </form>
-
-        <p className="login-footer-note">
-          All activity is logged and monitored.
-        </p>
+      <div>
+        <label htmlFor="username" className="label">Username</label>
+        <div className="relative">
+          <User className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-400" />
+          <input id="username" name="username" autoComplete="username" autoFocus className="input h-11 pl-10" placeholder="admin" value={form.username} onChange={(e) => setForm((f) => ({ ...f, username: e.target.value }))} disabled={loading} />
+        </div>
       </div>
 
+      <div>
+        <label htmlFor="password" className="label">Password</label>
+        <div className="relative">
+          <Lock className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-400" />
+          <input id="password" name="password" type={showPassword ? 'text' : 'password'} autoComplete="current-password" className="input h-11 pl-10 pr-11" placeholder="••••••••" value={form.password} onChange={(e) => setForm((f) => ({ ...f, password: e.target.value }))} disabled={loading} />
+          <button type="button" onClick={() => setShowPassword((s) => !s)} className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-2 text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-600 dark:hover:bg-zinc-800" aria-label={showPassword ? 'Hide password' : 'Show password'}>
+            {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+          </button>
+        </div>
+      </div>
 
-      <style>{`
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      <Button type="submit" size="lg" className="w-full" loading={loading} iconRight={ArrowRight}>
+        {loading ? 'Signing in…' : 'Sign in'}
+      </Button>
+    </form>
+  );
+}
 
-        .login-root {
-          min-height: 100vh;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          padding: 1.5rem;
-          background: #f9fafb;
-          font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
-        }
+const FEATURES = [
+  { icon: Zap, title: 'Smart pacing', text: 'Randomised delays, sending hours and daily caps keep accounts healthy.' },
+  { icon: BarChart3, title: 'Live delivery insights', text: 'Track sent, delivered, read and replied for every campaign.' },
+  { icon: ShieldCheck, title: 'Safe by design', text: 'Never double-sends, honours opt-outs, recovers from restarts.' },
+];
 
-        .login-card {
-          width: 100%;
-          max-width: 380px;
-          background: #ffffff;
-          border: 1px solid #e5e7eb;
-          border-radius: 16px;
-          padding: 2.5rem 2rem;
-          opacity: 0;
-          transform: translateY(10px);
-          transition: opacity 0.35s ease, transform 0.35s ease;
-        }
-        .login-card--visible { opacity: 1; transform: translateY(0); }
+export default function LoginPage() {
+  return (
+    <div className="grid min-h-screen lg:grid-cols-[1.1fr_1fr]">
+      <div className="relative hidden overflow-hidden bg-zinc-950 lg:block">
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_20%,rgba(16,185,129,0.35),transparent_45%),radial-gradient(circle_at_80%_70%,rgba(5,150,105,0.25),transparent_50%)]" />
+        <div className="absolute inset-0 opacity-[0.07] [background-image:linear-gradient(white_1px,transparent_1px),linear-gradient(90deg,white_1px,transparent_1px)] [background-size:44px_44px]" />
+        <div className="relative flex h-full flex-col justify-between p-12 text-white">
+          <div className="flex items-center gap-3">
+            <Image src="/logo.png" alt="" width={40} height={40} className="rounded-xl" priority />
+            <span className="text-lg font-semibold tracking-tight">WhatBot</span>
+          </div>
+          <div className="max-w-md">
+            <h1 className="text-4xl font-semibold leading-tight tracking-tight">Reach your audience on WhatsApp, reliably.</h1>
+            <p className="mt-4 text-zinc-400">Run multi-profile campaigns with scheduling, rotation and delivery tracking from one dashboard.</p>
+            <div className="mt-10 space-y-5">
+              {FEATURES.map((f, i) => (
+                <div key={f.title} className="flex animate-fade-up gap-4" style={{ animationDelay: `${150 + i * 100}ms` }}>
+                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-white/10 ring-1 ring-white/15 backdrop-blur">
+                    <f.icon className="h-5 w-5 text-brand-300" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-semibold">{f.title}</p>
+                    <p className="mt-0.5 text-sm text-zinc-400">{f.text}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <p className="text-xs text-zinc-500">© {new Date().getFullYear()} WhatBot</p>
+        </div>
+      </div>
 
-        .login-mark {
-          width: 40px; height: 40px;
-          border-radius: 10px;
-          background: #16a34a;
-          display: flex; align-items: center; justify-content: center;
-          margin-bottom: 1.5rem;
-        }
-        .login-mark__icon {
-          color: #fff;
-          font-size: 18px;
-          font-weight: 700;
-          line-height: 1;
-          letter-spacing: -0.5px;
-        }
-
-        .login-title {
-          font-size: 22px;
-          font-weight: 600;
-          color: #111827;
-          letter-spacing: -0.4px;
-        }
-        .login-sub {
-          margin-top: 4px;
-          font-size: 14px;
-          color: #6b7280;
-        }
-
-        .login-form {
-          margin-top: 1.75rem;
-          display: flex;
-          flex-direction: column;
-          gap: 1.25rem;
-        }
-
-        .field { display: flex; flex-direction: column; gap: 6px; }
-        .field__label {
-          font-size: 13px;
-          font-weight: 500;
-          color: #374151;
-        }
-        .field__input {
-          width: 100%;
-          height: 40px;
-          padding: 0 12px;
-          border: 1px solid #d1d5db;
-          border-radius: 8px;
-          font-size: 14px;
-          color: #111827;
-          background: #fff;
-          outline: none;
-          transition: border-color 0.15s;
-        }
-        .field__input:focus { border-color: #16a34a; box-shadow: 0 0 0 3px rgba(22,163,74,0.1); }
-        .field__input::placeholder { color: #9ca3af; }
-        .field__input:disabled { background: #f9fafb; opacity: 0.7; cursor: not-allowed; }
-
-        .field__password-wrap { position: relative; }
-        .field__input--password { padding-right: 40px; }
-        .field__reveal {
-          position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
-          background: none; border: none; cursor: pointer;
-          color: #9ca3af; display: flex; align-items: center;
-          padding: 4px; border-radius: 4px;
-          transition: color 0.15s;
-        }
-        .field__reveal:hover { color: #374151; }
-
-        .btn-primary {
-          display: flex; align-items: center; justify-content: center; gap: 8px;
-          height: 40px; padding: 0 16px;
-          border-radius: 8px; border: none; cursor: pointer;
-          font-size: 14px; font-weight: 500;
-          background: #111827; color: #fff;
-          transition: background 0.15s, opacity 0.15s;
-        }
-        .btn-primary:hover:not(:disabled) { background: #1f2937; }
-        .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
-        .btn-primary--full { width: 100%; margin-top: 0.25rem; }
-
-        .spinner {
-          display: inline-block;
-          width: 15px; height: 15px;
-          border: 2px solid rgba(255,255,255,0.3);
-          border-top-color: #fff;
-          border-radius: 50%;
-          animation: spin 0.6s linear infinite;
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
-
-        .login-footer-note {
-          margin-top: 1.75rem;
-          font-size: 12px;
-          color: #9ca3af;
-          text-align: center;
-        }
-      `}</style>
+      <div className="flex items-center justify-center px-6 py-12">
+        <div className="w-full max-w-sm animate-fade-up">
+          <div className="mb-8 flex items-center gap-3 lg:hidden">
+            <Image src="/logo.png" alt="" width={36} height={36} className="rounded-xl" priority />
+            <span className="text-lg font-semibold">WhatBot</span>
+          </div>
+          <h2 className="text-2xl font-semibold tracking-tight text-zinc-900 dark:text-white">Welcome back</h2>
+          <p className="mb-8 mt-1.5 text-sm text-zinc-500 dark:text-zinc-400">Sign in to manage your campaigns.</p>
+          <Suspense fallback={<div className="skeleton h-64 w-full" />}>
+            <LoginForm />
+          </Suspense>
+        </div>
+      </div>
     </div>
   );
 }

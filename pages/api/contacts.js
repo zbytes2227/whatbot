@@ -1,213 +1,165 @@
+import mongoose from 'mongoose';
+import Campaign from '@/models/Campaigns';
 import ContactList from '@/models/ContactList';
-import { verifyAuth } from '@/lib/auth';
-import connectToMongoDB from '@/lib/mongodb';
-import formidable from 'formidable';
+import { HttpError, badRequest, requireObjectId, str, withApi } from '@/lib/api';
+import { csvRow, startCsvDownload } from '@/lib/csv';
+import { extractPhones, MAX_NUMBERS_PER_LIST, normalizePhone } from '@/lib/phone';
 
-export const config = { api: { bodyParser: false } };
+export const config = { api: { bodyParser: { sizeLimit: '8mb' } } };
 
-// Parse multipart form data
-function parseForm(req) {
-  return new Promise((resolve, reject) => {
-    const form = formidable({ multiples: false });
-    form.parse(req, (err, fields, files) => {
-      if (err) reject(err);
-      else resolve({ fields, files });
-    });
-  });
-}
+const ACTIVE_STATUSES = ['pending', 'running', 'paused', 'scheduled', 'needs_review'];
 
-// Tolerant and debug-friendly parser
- function parsePhoneNumbersWithDebug(inputRaw) {
-  const debugInfo = {
-    originalType: typeof inputRaw,
-    originalValue: inputRaw,
-    steps: []
-  };
-
-  let input = inputRaw;
-
+function parseNumbers(input) {
   if (Array.isArray(input)) {
-    debugInfo.steps.push(`Input was array, taking first element`);
-    input = input[0] || '';
+    const seen = new Set();
+    const numbers = [];
+    let invalid = 0;
+    for (const raw of input.slice(0, MAX_NUMBERS_PER_LIST * 2)) {
+      const n = normalizePhone(raw);
+      if (!n) invalid += 1;
+      else if (!seen.has(n)) {
+        seen.add(n);
+        numbers.push(n);
+      }
+    }
+    return { numbers, invalid };
   }
-  if (Buffer.isBuffer(input)) {
-    debugInfo.steps.push(`Input was Buffer, converting to string`);
-    input = input.toString('utf-8');
-  }
-  if (typeof input !== 'string') {
-    debugInfo.steps.push(`Input was ${typeof input}, converting to string`);
-    input = String(input || '');
-  }
-
-  debugInfo.cleanedInitial = input;
-
-  if (!input.trim()) {
-    debugInfo.error = 'Input text is empty after trimming.';
-    return { numbers: [], debug: debugInfo };
-  }
-
-  // Step 1: Remove non-ASCII (emoji, Hindi text, fancy spaces)
-  input = input.replace(/[^\x00-\x7F]/g, ' ');
-  debugInfo.steps.push('Removed non-ASCII characters');
-
-  // Step 2: Remove all punctuation except "+"
-  input = input.replace(/[^0-9\+\s]/g, ' ');
-  debugInfo.steps.push('Removed all punctuation except + for country code');
-
-  // Step 3: Collapse extra spaces
-  input = input.replace(/\s+/g, ' ');
-  debugInfo.steps.push('Collapsed multiple spaces');
-
-  // ✅ Step 4: Join split digit groups (so `95983 83398` → `9598383398`)
-  input = input.replace(/(\d{5})\s+(\d{5})/g, '$1$2');
-  debugInfo.steps.push('Joined split 5-5 digit groups into continuous 10 digits');
-
-  // Step 5: Extract numbers tolerant of +91/91/0
-  const regex = /(?:\+91|91|0)?\s*([6-9]\d{9})/g;
-  const seen = new Set();
-  let match;
-  while ((match = regex.exec(input)) !== null) {
-    seen.add(match[1]); // store only 10-digit form
-  }
-
-  const result = Array.from(seen);
-  debugInfo.extracted = result;
-
-  if (result.length === 0) {
-    debugInfo.error = 'No valid Indian mobile numbers found after parsing.';
-  } else {
-    debugInfo.success = `Found ${result.length} valid phone number(s).`;
-  }
-
-  return { numbers: result, debug: debugInfo };
+  return extractPhones(typeof input === 'string' ? input : '');
 }
 
-
-
-// Mongo fetch
-async function getContactLists(userId) {
-  return await ContactList.find({ userId }).lean();
-}
-
-// Import contacts
-async function importContacts(userId, { listId, listName, phoneNumbers }) {
-  if (!phoneNumbers?.length) throw new Error('Phone numbers array is empty');
-
-  if (listId) {
-    const list = await ContactList.findOne({ _id: listId, userId });
-    if (!list) throw new Error('Contact list not found');
-
-    const existingNumbers = new Set(list.contacts);
-    const newNumbers = phoneNumbers.filter(num => !existingNumbers.has(num));
-    list.contacts.push(...newNumbers);
-    await list.save();
-    return list;
-  } else {
-    if (!listName) throw new Error('List name is required for new contact list');
-    const newList = new ContactList({
-      userId,
-      name: listName,
-      description: `Contact list with ${phoneNumbers.length} numbers`,
-      contacts: phoneNumbers,
-    });
-    await newList.save();
-    return newList;
-  }
-}
-
-// Update contact list
-async function updateContactList(userId, listId, { name, phoneNumbers }) {
-  if (!listId) throw new Error('List ID is required');
-  const list = await ContactList.findOne({ _id: listId, userId });
-  if (!list) throw new Error('Contact list not found');
-  if (name) list.name = name;
-  if (phoneNumbers?.length) list.contacts = phoneNumbers;
-  await list.save();
+async function findOwned(listId, user, projection) {
+  requireObjectId(listId, 'list id');
+  const list = await ContactList.findOne({ _id: listId, userId: user.id }).select(projection || '');
+  if (!list) throw new HttpError(404, 'Contact list not found');
   return list;
 }
 
-// Delete contact list
-async function deleteContactList(userId, listId) {
-  const deleted = await ContactList.findOneAndDelete({ _id: listId, userId });
-  if (!deleted) throw new Error('Contact list not found or already deleted');
-  return deleted;
+function mergeNumbers(existing, incoming) {
+  const seen = new Set();
+  const merged = [];
+  for (const raw of existing) {
+    const n = normalizePhone(raw) || String(raw);
+    if (!seen.has(n)) {
+      seen.add(n);
+      merged.push(n);
+    }
+  }
+  let added = 0;
+  for (const n of incoming) {
+    if (!seen.has(n)) {
+      seen.add(n);
+      merged.push(n);
+      added += 1;
+    }
+  }
+  return { merged, added };
 }
 
-// Main handler
-export default async function handler(req, res) {
-  try {
-    await connectToMongoDB();
-  } catch (error) {
-    console.error('MongoDB connection failed:', error);
-    return res.status(500).json({ success: false, msg: 'Database connection failed' });
-  }
-
-  let user;
-  try {
-    const auth = await verifyAuth(req);
-    user = auth.user;
-  } catch (err) {
-    return res.status(err.status || 401).json({ success: false, msg: err.msg || 'Unauthorized' });
-  }
-
-  try {
-    if (req.method === 'GET') {
-      const lists = await getContactLists(user.id);
-      return res.status(200).json({ success: true, lists });
-    }
-
-    if (req.method === 'POST') {
-      const { fields } = await parseForm(req);
-
-      const action = Array.isArray(fields.action) ? fields.action[0] : fields.action;
-      let numbersText = Array.isArray(fields.numbers) ? fields.numbers[0] : (fields.numbers || '');
-      numbersText = numbersText.toString();
-
-      const listId = Array.isArray(fields.listId) ? fields.listId[0] : (fields.listId || null);
-      const listName = Array.isArray(fields.listName) ? fields.listName[0] : (fields.listName || null);
-      const name = Array.isArray(fields.name) ? fields.name[0] : (fields.name || null);
-
-      const { numbers: phoneNumbers, debug } = parsePhoneNumbersWithDebug(numbersText);
-
-      if (action === 'import') {
-        if (phoneNumbers.length === 0) {
-          return res.status(400).json({ success: false, msg: 'No valid phone numbers provided', debug });
-        }
-        const updatedList = await importContacts(user.id, { listId, listName, phoneNumbers });
-        return res.status(200).json({
-          success: true,
-          list: updatedList,
-          msg: `${phoneNumbers.length} phone numbers processed`
-        });
-      }
-
-      if (action === 'update') {
-        if (!listId) return res.status(400).json({ success: false, msg: 'listId is required' });
-        const updatedList = await updateContactList(user.id, listId, {
-          name,
-          phoneNumbers
-        });
-        return res.status(200).json({ success: true, list: updatedList });
-      }
-
-      return res.status(400).json({
-        success: false,
-        msg: `Invalid action for POST: "${action}". Expected "import" or "update"`,
-        receivedFields: Object.keys(fields)
-      });
-    }
-
-    if (req.method === 'DELETE') {
-      const { listId } = req.query;
-      if (!listId) return res.status(400).json({ success: false, msg: 'listId query parameter is required' });
-      await deleteContactList(user.id, listId);
-      return res.status(200).json({ success: true, msg: 'Contact list deleted' });
-    }
-
-    res.status(405).json({ success: false, msg: 'Method not allowed' });
-
-  } catch (error) {
-    console.error('API /contacts error:', error);
-    res.status(500).json({ success: false, msg: error.message || 'Internal server error' });
-  }
+function assertSize(count) {
+  if (count > MAX_NUMBERS_PER_LIST) throw badRequest(`A list can hold at most ${MAX_NUMBERS_PER_LIST.toLocaleString()} numbers`);
 }
+
+export default withApi(async (req, res, { user, logger }) => {
+  if (req.method === 'GET') {
+    const { listId, format } = req.query;
+
+    if (listId) {
+      const list = await findOwned(listId, user);
+      if (format === 'csv') {
+        startCsvDownload(res, `${list.name}.csv`);
+        res.write(csvRow(['number']));
+        for (const n of list.contacts) res.write(csvRow([n]));
+        return res.end();
+      }
+      return res.status(200).json({ success: true, list });
+    }
+
+    const [lists, usage] = await Promise.all([
+      ContactList.aggregate([
+        { $match: { userId: user.id } },
+        { $project: { name: 1, description: 1, createdAt: 1, updatedAt: 1, count: { $size: { $ifNull: ['$contacts', []] } }, preview: { $slice: [{ $ifNull: ['$contacts', []] }, 3] } } },
+        { $sort: { createdAt: -1 } },
+      ]),
+      Campaign.aggregate([
+        { $match: { userId: user.id } },
+        { $group: { _id: '$contactList', total: { $sum: 1 }, active: { $sum: { $cond: [{ $in: ['$status', ACTIVE_STATUSES] }, 1, 0] } } } },
+      ]),
+    ]);
+    const usageMap = new Map(usage.map((u) => [String(u._id), u]));
+    return res.status(200).json({
+      success: true,
+      lists: lists.map((l) => ({ ...l, campaigns: usageMap.get(String(l._id))?.total || 0, activeCampaigns: usageMap.get(String(l._id))?.active || 0 })),
+    });
+  }
+
+  if (req.method === 'POST') {
+    const body = req.body || {};
+    const action = body.action;
+
+    if (action === 'preview') {
+      const { numbers, invalid } = parseNumbers(body.numbers);
+      return res.status(200).json({ success: true, valid: numbers.length, invalid, sample: numbers.slice(0, 10) });
+    }
+
+    if (action === 'create') {
+      const name = str(body.name, { max: 120 });
+      if (!name) throw badRequest('List name is required');
+      const { numbers, invalid } = parseNumbers(body.numbers);
+      if (!numbers.length) throw badRequest('No valid phone numbers found');
+      assertSize(numbers.length);
+      const list = await ContactList.create({ userId: user.id, name, description: str(body.description, { max: 500 }), contacts: numbers });
+      logger.info('Contact list created', { listId: String(list._id), count: numbers.length });
+      return res.status(201).json({ success: true, listId: list._id, added: numbers.length, invalid, msg: `Created "${name}" with ${numbers.length} numbers` });
+    }
+
+    if (action === 'append') {
+      const list = await findOwned(body.listId, user);
+      const { numbers, invalid } = parseNumbers(body.numbers);
+      if (!numbers.length) throw badRequest('No valid phone numbers found');
+      const { merged, added } = mergeNumbers(list.contacts, numbers);
+      assertSize(merged.length);
+      list.contacts = merged;
+      await list.save();
+      return res.status(200).json({ success: true, added, duplicates: numbers.length - added, invalid, total: merged.length, msg: `Added ${added} new numbers` });
+    }
+
+    if (action === 'update') {
+      const list = await findOwned(body.listId, user);
+      const name = str(body.name, { max: 120 });
+      if (name) list.name = name;
+      if (body.description !== undefined) list.description = str(body.description, { max: 500 });
+      let invalid = 0;
+      if (body.numbers !== undefined) {
+        const parsed = parseNumbers(body.numbers);
+        if (!parsed.numbers.length) throw badRequest('A list must contain at least one valid number');
+        assertSize(parsed.numbers.length);
+        const active = await Campaign.exists({ contactList: list._id, status: { $in: ['running', 'paused', 'needs_review'] }, processedNumbers: { $gt: 0 } });
+        if (active) throw new HttpError(409, 'This list is used by a campaign in progress. Add numbers instead of replacing them, or stop the campaign first.');
+        list.contacts = parsed.numbers;
+        invalid = parsed.invalid;
+      }
+      await list.save();
+      return res.status(200).json({ success: true, total: list.contacts.length, invalid, msg: 'Contact list updated' });
+    }
+
+    if (action === 'removeNumbers') {
+      const list = await findOwned(body.listId, user);
+      const remove = new Set(parseNumbers(body.numbers).numbers);
+      const before = list.contacts.length;
+      list.contacts = list.contacts.filter((raw) => !remove.has(normalizePhone(raw) || raw));
+      if (!list.contacts.length) throw badRequest('A list must keep at least one number. Delete the list instead.');
+      await list.save();
+      return res.status(200).json({ success: true, removed: before - list.contacts.length, total: list.contacts.length });
+    }
+
+    throw badRequest('Unknown action');
+  }
+
+  // DELETE
+  const list = await findOwned(req.query.listId, user, '_id name');
+  const inUse = await Campaign.countDocuments({ contactList: new mongoose.Types.ObjectId(String(list._id)), status: { $in: ACTIVE_STATUSES } });
+  if (inUse) throw new HttpError(409, `This list is used by ${inUse} active campaign(s). Stop or delete them first.`);
+  await ContactList.deleteOne({ _id: list._id });
+  logger.info('Contact list deleted', { listId: String(list._id) });
+  return res.status(200).json({ success: true, msg: 'Contact list deleted' });
+}, { methods: ['GET', 'POST', 'DELETE'], name: 'contacts' });

@@ -1,144 +1,75 @@
-import { clients, sendWhatsAppMessage } from '@/lib/whatsappClients';
+// Public integration endpoint. Authenticated with TOKEN_API_PUBLIC via the
+// `accesstoken` body field, an X-API-Key header or a Bearer header.
 import MessageHistory from '@/models/MessageHistory';
-import connectToMongoDB from '@/lib/mongodb';
-import { createLogger, getRequestContext } from '@/lib/logger';
+import { HttpError, withApi } from '@/lib/api';
+import { verifyPublicApiToken } from '@/lib/auth';
+import { normalizePhone } from '@/lib/phone';
+import { checkRateLimit, getClientIp } from '@/lib/rateLimit';
+import { clients, getReadyClientIds, sendWhatsAppMessage } from '@/lib/whatsappClients';
 
-const baseLogger = createLogger({ module: 'api.sendMessage' });
+const RATE = { limit: Number(process.env.API_RATE_LIMIT_PER_MIN || 60), windowMs: 60 * 1000 };
 
-export default async function handler(req, res) {
-  const logger = baseLogger.child(getRequestContext(req, '/api/sendMessage'));
+export default withApi(async (req, res, { logger }) => {
+  const { contact, msg, client: preferredClient, accesstoken } = req.body || {};
+  const ip = getClientIp(req);
 
-  if (req.method !== 'POST') {
-    return res.status(405).json({
-      success: false,
-      msg: 'Only POST method allowed',
-    });
-
+  if (!verifyPublicApiToken(req, accesstoken)) {
+    const attempts = checkRateLimit(`api-bad-token:${ip}`, { limit: 20, windowMs: 15 * 60 * 1000 });
+    logger.warn('Rejected sendMessage request with invalid token', { ip });
+    if (!attempts.allowed) throw new HttpError(429, 'Too many invalid API token attempts');
+    throw new HttpError(401, 'Invalid API token');
   }
 
-
-  // s
-  try {
-    await connectToMongoDB();
-  } catch (err) {
-    logger.error('Database connection failed', { err });
-    return res.status(500).json({
-      success: false,
-      msg: 'Database connection failed',
-    });
+  const rate = checkRateLimit('api-send', RATE);
+  if (!rate.allowed) {
+    res.setHeader('Retry-After', String(rate.retryAfterSec));
+    throw new HttpError(429, 'Rate limit exceeded');
   }
 
-  let messageHistoryId = null;
+  if (!contact) throw new HttpError(400, 'Contact number is required');
+  if (typeof msg !== 'string' || !msg.trim()) throw new HttpError(400, 'Message is required and cannot be empty');
+  if (msg.length > 4096) throw new HttpError(400, 'Message exceeds 4096 characters');
+
+  const number = normalizePhone(contact);
+  if (!number) throw new HttpError(400, 'Invalid phone number format');
+
+  let clientId;
+  if (preferredClient) {
+    if (!clients[preferredClient]) throw new HttpError(400, `Unknown client ${preferredClient}`);
+    if (!getReadyClientIds([preferredClient]).length) throw new HttpError(503, `Client ${preferredClient} is not connected`);
+    clientId = preferredClient;
+  } else {
+    const ready = getReadyClientIds();
+    if (!ready.length) throw new HttpError(503, 'No WhatsApp clients are currently connected');
+    clientId = ready[Math.floor(Math.random() * ready.length)];
+  }
+
+  const text = msg.trim();
+  const history = await MessageHistory.create({
+    number, originalNumber: String(contact).slice(0, 40), message: text, deliveryStatus: 'pending',
+    source: 'api', clientUsed: clientId, sentTime: new Date(),
+  });
 
   try {
-    const { contact, msg, client: preferredClient, accesstoken } = req.body;
-
-    if (!accesstoken) {
-      return res.status(400).json({ success: false, msg: 'API token is required' });
-    }
-
-    if (accesstoken !== process.env.TOKEN_API_PUBLIC) {
-      logger.warn('Rejected sendMessage request with invalid token');
-      return res.status(401).json({ success: false, msg: 'Invalid API token' });
-    }
-
-    if (!contact) {
-      return res.status(400).json({ success: false, msg: 'Contact number is required' });
-    }
-
-    if (!msg || msg.trim() === '') {
-      return res.status(400).json({ success: false, msg: 'Message is required and cannot be empty' });
-    }
-
-    const formattedNumber = formatIndianNumber(contact);
-    if (formattedNumber.length < 10) {
-      return res.status(400).json({ success: false, msg: 'Invalid phone number format' });
-    }
-
-    let selectedClient = null;
-    let selectedClientId = null;
-
-    if (preferredClient) {
-      if (clients[preferredClient]?.ready && clients[preferredClient]?.client) {
-        selectedClient = clients[preferredClient].client;
-        selectedClientId = preferredClient;
-      } else {
-        return res.status(400).json({
-          success: false,
-          msg: `Specified client ${preferredClient} is not ready or doesn't exist`,
-        });
-      }
-    } else {
-      const activeClients = Object.entries(clients).filter(([, client]) => client.ready && client.client);
-      if (activeClients.length === 0) {
-        return res.status(503).json({
-          success: false,
-          msg: 'No WhatsApp clients are currently active',
-        });
-      }
-      [selectedClientId, { client: selectedClient }] = activeClients[0];
-    }
-
-    const messageHistory = new MessageHistory({
-      number: formattedNumber,
-      originalNumber: contact,
-      message: msg.trim(),
-      deliveryStatus: 'pending',
-      source: 'api',
-      clientUsed: selectedClientId,
-      hasMedia: false,
-      sentTime: new Date(),
-    });
-
-    const savedHistory = await messageHistory.save();
-    messageHistoryId = savedHistory._id;
-
-    const chatId = `${formattedNumber}@c.us`;
-    const { deliveryTime } = await sendWhatsAppMessage({ clientId: selectedClientId, chatId, text: msg.trim() });
-    await MessageHistory.findByIdAndUpdate(messageHistoryId, { deliveryStatus: 'sent', deliveryTime });
-
-    logger.info('Message sent successfully', {
-      clientId: selectedClientId,
-      formattedNumber,
-      deliveryTime,
-      messageHistoryId: String(messageHistoryId),
-    });
-
+    const result = await sendWhatsAppMessage({ clientId, to: number, text });
+    await MessageHistory.updateOne({ _id: history._id }, { $set: { deliveryStatus: 'sent', deliveryTime: result.deliveryTime, waMessageId: result.messageId } });
     return res.status(200).json({
       success: true,
       msg: 'Message sent successfully',
       data: {
-        contact: formattedNumber,
+        contact: number,
         originalContact: contact,
-        clientUsed: selectedClientId,
-        deliveryTime: `${deliveryTime}ms`,
+        clientUsed: clientId,
+        deliveryTime: `${result.deliveryTime}ms`,
         timestamp: new Date().toISOString(),
-        historyId: messageHistoryId,
+        historyId: history._id,
       },
     });
-  } catch (error) {
-    logger.error('Send message API error', { err: error, messageHistoryId });
-
-    if (messageHistoryId) {
-      try {
-        await MessageHistory.findByIdAndUpdate(messageHistoryId, { deliveryStatus: error.code === 'CLIENT_UNAVAILABLE' ? 'client_unavailable' : 'failed', error: error.message });
-      } catch (updateError) {
-        logger.error('Failed to update message history after send failure', { err: updateError, messageHistoryId });
-      }
-    }
-
-    return res.status(error.code === 'CLIENT_UNAVAILABLE' ? 503 : 500).json({
-      success: false,
-      msg: 'Failed to send message',
-      details: error.message,
-    });
+  } catch (err) {
+    const status = err.code === 'NUMBER_NOT_REGISTERED' ? 'failed' : err.stage === 'send' ? 'unknown' : 'failed';
+    await MessageHistory.updateOne({ _id: history._id }, { $set: { deliveryStatus: status, error: err.message } }).catch(() => {});
+    logger.warn('API send failed', { clientId, number, code: err.code, stage: err.stage });
+    const httpStatus = err.code === 'NUMBER_NOT_REGISTERED' ? 422 : err.code === 'CLIENT_UNAVAILABLE' ? 503 : 502;
+    throw new HttpError(httpStatus, 'Failed to send message', { details: err.message, historyId: history._id });
   }
-}
-
-function formatIndianNumber(number) {
-  const cleaned = String(number).replace(/[^0-9]/g, '');
-  if (cleaned.startsWith('91') && cleaned.length === 12) return cleaned;
-  if (cleaned.startsWith('0') && cleaned.length === 11) return `91${cleaned.substring(1)}`;
-  if (cleaned.length === 10) return `91${cleaned}`;
-  return cleaned;
-}
+}, { methods: ['POST'], auth: false, name: 'sendMessage' });

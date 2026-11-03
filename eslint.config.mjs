@@ -1,17 +1,10 @@
-export default [
+import nextCoreWebVitals from 'eslint-config-next/core-web-vitals';
+
+const config = [
   {
-    ignores: [".next/**", "node_modules/**", "dist/**", ".wwebjs_auth/**", "whatsapp-sessions/**"]
+    ignores: ['.next/**', 'node_modules/**', 'dist/**', '.baileys_auth/**', 'whatsapp-sessions/**', 'logs/**'],
   },
-  {
-    files: ["**/*.js", "**/*.jsx", "**/*.mjs"],
-    languageOptions: {
-      ecmaVersion: "latest",
-      sourceType: "module",
-      parserOptions: {
-        ecmaFeatures: {
-          jsx: true
-        }
-      }
-    }
-  }
+  ...nextCoreWebVitals,
 ];
+
+export default config;

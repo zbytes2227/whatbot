@@ -1,1228 +1,477 @@
+import { createHash, randomBytes } from 'crypto';
 import Campaign from '@/models/Campaigns';
 import ContactList from '@/models/ContactList';
-import { clients, sendWhatsAppMessage } from '@/lib/whatsappClients';
-import { verifyAuth } from '@/lib/auth';
-import formidable from 'formidable';
-import fs from 'fs';
-import connectToMongoDB from '@/lib/mongodb';
-import MessageHistory from '@/models/MessageHistory';
-import { createLogger } from '@/lib/logger';
-import { randomUUID } from 'crypto';
+import Media from '@/models/Media';
+import MessageHistory, { DELIVERY_STATUSES, SENT_STATUSES } from '@/models/MessageHistory';
+import { HttpError, badRequest, firstFile, intInRange, parseMultipart, readJsonBody, requireObjectId, str, withApi } from '@/lib/api';
+import { cleanupTempFiles, MAX_MEDIA_BYTES, storeUpload } from '@/lib/media';
+import { csvRow, startCsvDownload } from '@/lib/csv';
+import { normalizePhone } from '@/lib/phone';
+import { buildCampaignSummary, isRunningLocally, queueCampaignRun, runFilter, wakeCampaign } from '@/lib/campaignRunner';
+import { DEFAULT_TIMEZONE, isValidDate, isValidTime, isValidTimeZone, parseZonedDateTime, resolveScheduledStart } from '@/lib/campaignTime';
+import { clients, getProfileIds } from '@/lib/whatsappClients';
 
-const logger = createLogger({ module: 'api.campaigns' });
+export const config = { api: { bodyParser: false, responseLimit: false } };
 
-export const config = {
-  api: {
-    bodyParser: false,
-    responseLimit: false,
-  },
-};
-
-const SCHEDULER_KEY = '__whatmot_campaign_scheduler';
-const RUNNING_KEY = '__whatmot_campaign_running_set';
-const TICK_KEY = '__whatmot_campaign_scheduler_tick_active';
-// The lease must cover a slow send, a MongoDB failover, and the scheduler's
-// polling interval. Heartbeats keep it alive during the configured campaign
-// delay; the lease itself is only the crash-recovery safety net.
-const RUNNER_LEASE_MS = 5 * 60 * 1000;
-const RUNNER_HEARTBEAT_MS = 30 * 1000;
-const MONGO_RETRY_LIMIT = 3;
-
-if (!global[SCHEDULER_KEY]) {
-  global[SCHEDULER_KEY] = { started: false, timer: null };
-}
-if (!global[RUNNING_KEY]) {
-  global[RUNNING_KEY] = new Set();
-}
-
-function parseForm(req) {
-  return new Promise((resolve, reject) => {
-    const form = formidable({
-      multiples: true,
-      maxFileSize: 10 * 1024 * 1024,
-    });
-    form.parse(req, (err, fields, files) => {
-      if (err) reject(err);
-      else resolve({ fields, files });
-    });
-  });
-}
-
-function getFieldValue(field) {
-  if (Array.isArray(field)) return field[0] || '';
-  return field || '';
-}
-
-function formatIndianNumber(number) {
-  const cleaned = String(number).replace(/[^0-9]/g, '');
-  if (cleaned.startsWith('91') && cleaned.length === 12) return cleaned;
-  if (cleaned.startsWith('0') && cleaned.length === 11) return `91${cleaned.substring(1)}`;
-  if (cleaned.length === 10) return `91${cleaned}`;
-  return cleaned;
-}
+const MAX_MESSAGES = 4;
+const MAX_TEXT = 4096;
 
 function generateCampaignId() {
-  return `campaign_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+  return `campaign_${Date.now()}_${randomBytes(5).toString('hex')}`;
 }
 
-const DEFAULT_CAMPAIGN_TIMEZONE = 'Asia/Kolkata';
-
-function getCampaignTimeParts(date = new Date(), timeZone = DEFAULT_CAMPAIGN_TIMEZONE) {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-  }).formatToParts(date);
-  const values = Object.fromEntries(parts.filter(({ type }) => type !== 'literal').map(({ type, value }) => [type, value]));
-  return { year: Number(values.year), month: Number(values.month), day: Number(values.day), hour: Number(values.hour), minute: Number(values.minute) };
-}
-
-function getMinutesSinceMidnight(value) {
-  const [hours, minutes] = String(value || '00:00').split(':').map(Number);
-  return (Number.isFinite(hours) ? hours : 0) * 60 + (Number.isFinite(minutes) ? minutes : 0);
-}
-
-function getTimeZoneDate(localDate, timeZone, dayOffset = 0) {
-  const utcGuess = Date.UTC(localDate.year, localDate.month - 1, localDate.day + dayOffset, localDate.hour, localDate.minute);
-  const zoned = getCampaignTimeParts(new Date(utcGuess), timeZone);
-  const zonedAsUtc = Date.UTC(zoned.year, zoned.month - 1, zoned.day, zoned.hour, zoned.minute);
-  return new Date(utcGuess - (zonedAsUtc - utcGuess));
-}
-
-function isWithinSendingHours(scheduling, now = new Date()) {
-  if (!scheduling?.startTime || !scheduling?.endTime) return true;
-  const current = getCampaignTimeParts(now, scheduling.timezone || DEFAULT_CAMPAIGN_TIMEZONE);
-  const currentMinutes = current.hour * 60 + current.minute;
-  const startMinutes = getMinutesSinceMidnight(scheduling.startTime);
-  const endMinutes = getMinutesSinceMidnight(scheduling.endTime);
-  return startMinutes <= endMinutes
-    ? currentMinutes >= startMinutes && currentMinutes <= endMinutes
-    : currentMinutes >= startMinutes || currentMinutes <= endMinutes;
-}
-
-function getNextResumeTime(scheduling, now = new Date()) {
-  if (!scheduling?.resumeNextDay || !scheduling?.startTime) return null;
-  const timeZone = scheduling.timezone || DEFAULT_CAMPAIGN_TIMEZONE;
-  const current = getCampaignTimeParts(now, timeZone);
-  const currentMinutes = current.hour * 60 + current.minute;
-  const startMinutes = getMinutesSinceMidnight(scheduling.startTime);
-  const endMinutes = getMinutesSinceMidnight(scheduling.endTime || scheduling.startTime);
-  const overnight = startMinutes > endMinutes;
-  const startsLaterToday = !overnight && currentMinutes < startMinutes;
-  const dayOffset = startsLaterToday || (overnight && currentMinutes < startMinutes) ? 0 : 1;
-  const [hour, minute] = String(scheduling.startTime).split(':').map(Number);
-  return getTimeZoneDate({ ...current, hour, minute }, timeZone, dayOffset);
-}
-
-function getCampaignScheduledDateTime(campaign) {
-  if (!campaign?.scheduling?.startDate || !campaign?.scheduling?.startTime) return null;
-  const dateObj = new Date(campaign.scheduling.startDate);
-  if (Number.isNaN(dateObj.getTime())) return null;
-  const dateStr = dateObj.toISOString().slice(0, 10);
-  return new Date(`${dateStr}T${campaign.scheduling.startTime}:00+05:30`);
-}
-
-function getScheduledTime(campaign) {
-  const scheduledDateTime = getCampaignScheduledDateTime(campaign);
-  if (!scheduledDateTime) return null;
-
-  return {
-    dateTime: scheduledDateTime,
-    formatted: scheduledDateTime.toLocaleString('en-IN', {
-      timeZone: 'Asia/Kolkata',
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    }),
-    isUpcoming: scheduledDateTime > new Date(),
-    isPast: scheduledDateTime < new Date(),
-  };
-}
-
-function toCsv(rows) {
-  const escapeCell = (value) => {
-    const str = value == null ? '' : String(value);
-    if (/[",\n]/.test(str)) {
-      return `"${str.replace(/"/g, '""')}"`;
-    }
-    return str;
-  };
-
-  return rows.map((row) => row.map(escapeCell).join(',')).join('\n');
-}
-
-function getDelayMs(delaySettings = {}) {
-  const minDelay = Math.max(1, Number(delaySettings.minDelay || 5));
-  const maxDelay = Math.max(minDelay, Number(delaySettings.maxDelay || 25));
-  const delayMinutes = Math.floor(Math.random() * (maxDelay - minDelay + 1) + minDelay);
-  return delayMinutes * 60 * 1000;
-}
-
-async function buildFormattedNumbers(campaign) {
-  const contactList = await ContactList.findById(campaign.contactList).lean();
-  if (!contactList) return [];
-
-  return (contactList.contacts || [])
-    .map((number) => ({ original: number, formatted: formatIndianNumber(number) }))
-    .filter((pair) => pair.formatted.length >= 10);
-}
-
-function getReadyCampaignClientIds(selectedClients = []) {
-  return selectedClients.filter((clientId) => {
-    const clientObj = clients[clientId];
-    return clientObj && clientObj.ready && clientObj.client;
-  });
-}
-
-function isTransientMongoError(error) {
-  const text = `${error?.name || ''} ${error?.message || ''}`.toLowerCase();
-  return error?.name === 'MongoServerSelectionError'
-    || error?.name === 'MongoNetworkError'
-    || error?.name === 'MongooseServerSelectionError'
-    || /timed out|timeout|connection|socket|topology|network/.test(text);
-}
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function withMongoRetry(operation, context = {}) {
-  let lastError;
-  for (let attempt = 1; attempt <= MONGO_RETRY_LIMIT; attempt += 1) {
-    try {
-      await connectToMongoDB();
-      return await operation();
-    } catch (error) {
-      lastError = error;
-      if (!isTransientMongoError(error) || attempt === MONGO_RETRY_LIMIT) break;
-      const backoffMs = 250 * (2 ** (attempt - 1));
-      logger.warn('Transient MongoDB operation failed; retrying', { ...context, attempt, backoffMs, err: error });
-      await sleep(backoffMs);
-    }
-  }
-  logger.error('MongoDB operation exhausted retries', { ...context, err: lastError });
-  throw lastError;
-}
-
-async function acquireRunnerLease(campaignId, leaseId) {
-  const now = new Date();
-  const lease = await withMongoRetry(() => Campaign.findOneAndUpdate(
-    {
-      campaignId,
-      status: { $in: ['pending', 'running'] },
-      $or: [{ runnerLeaseId: null }, { runnerLeaseExpiresAt: null }, { runnerLeaseExpiresAt: { $lte: now } }],
-    },
-    { $set: { status: 'running', runnerLeaseId: leaseId, runnerLeaseExpiresAt: new Date(now.getTime() + RUNNER_LEASE_MS) } },
-    { new: true }
-  ), { campaignId, operation: 'acquire_runner_lease' });
-  if (!lease) {
-    logger.info('Campaign runner lease held by another live runner', { campaignId });
-    return false;
-  }
-  return true;
-}
-
-async function renewRunnerLease(campaignId, leaseId) {
-  const updated = await withMongoRetry(() => Campaign.updateOne(
-    { campaignId, runnerLeaseId: leaseId, status: 'running' },
-    { $set: { runnerLeaseExpiresAt: new Date(Date.now() + RUNNER_LEASE_MS) } }
-  ), { campaignId, operation: 'renew_runner_lease' });
-  // matchedCount is the ownership check. modifiedCount can be zero when the
-  // database rounds an equal timestamp or an update is otherwise a no-op.
-  if (!updated.matchedCount) {
-    const error = new Error('Campaign runner lease was lost');
-    error.code = 'RUNNER_LEASE_LOST';
-    throw error;
-  }
-  logger.debug?.('Campaign runner lease renewed', { campaignId, leaseId });
-}
-
-function startRunnerHeartbeat(campaignId, leaseId) {
-  let stopped = false;
-  let leaseLost = null;
-  let renewing = false;
-  const timer = setInterval(async () => {
-    if (stopped || renewing) return;
-    renewing = true;
-    try {
-      await renewRunnerLease(campaignId, leaseId);
-      logger.info('Campaign runner lease renewed', { campaignId, leaseId });
-    } catch (error) {
-      if (error?.code === 'RUNNER_LEASE_LOST') {
-        leaseLost = error;
-        logger.error('Campaign runner lease ownership lost', { campaignId, leaseId, err: error });
-      } else {
-        // A transient outage is not evidence that another runner owns it.
-        // Keep retrying while the last lease remains valid.
-        logger.warn('Campaign runner heartbeat failed; retaining runner until lease expiry', { campaignId, leaseId, err: error });
-      }
-    } finally { renewing = false; }
-  }, RUNNER_HEARTBEAT_MS);
-  timer.unref?.();
-  return {
-    assertOwned() { if (leaseLost) throw leaseLost; },
-    stop() { stopped = true; clearInterval(timer); },
-  };
-}
-
-async function releaseRunnerLease(campaignId, leaseId) {
-  await withMongoRetry(() => Campaign.updateOne(
-    { campaignId, runnerLeaseId: leaseId },
-    { $set: { runnerLeaseId: null, runnerLeaseExpiresAt: null } }
-  ), { campaignId, operation: 'release_runner_lease' }).catch((error) => {
-    logger.warn('Could not release runner lease; expiry will recover it', { campaignId, err: error });
-  });
-}
-
-async function queueCampaignRun(campaignId, trigger = 'manual') {
-  const runningSet = global[RUNNING_KEY];
-  if (runningSet.has(campaignId)) {
-    return false;
-  }
-
-  runningSet.add(campaignId);
-  logger.info('Queueing campaign run', { campaignId, trigger });
-
-  setImmediate(async () => {
-    try {
-      await runCampaign(campaignId, trigger);
-    } catch (err) {
-      logger.error('Campaign run crashed', { campaignId, trigger, err });
-      logger.warn('Runner will be rediscovered by the scheduler after crash; no unsafe resend is attempted', { campaignId });
-    } finally {
-      runningSet.delete(campaignId);
-    }
-  });
-
-  return true;
-}
-
-async function ensureSchedulerRunning() {
-  const scheduler = global[SCHEDULER_KEY];
-  if (scheduler.started) return;
-
-  scheduler.started = true;
-  scheduler.timer = setInterval(async () => {
-    if (global[TICK_KEY]) return;
-    global[TICK_KEY] = true;
-    try {
-      await connectToMongoDB();
-      const now = new Date();
-
-      const dueScheduled = await Campaign.find({ status: 'scheduled' }).lean();
-      for (const campaign of dueScheduled) {
-        const startAt = getCampaignScheduledDateTime(campaign);
-        if (startAt && startAt <= now) {
-          await Campaign.updateOne({ campaignId: campaign.campaignId, status: 'scheduled' }, { status: 'pending' });
-          await queueCampaignRun(campaign.campaignId, 'scheduler_scheduled_start');
-        }
-      }
-
-      const dueResume = await Campaign.find({
-        status: 'paused',
-        nextResumeAt: { $ne: null, $lte: now },
-      }).lean();
-
-      for (const campaign of dueResume) {
-        await Campaign.updateOne(
-          { campaignId: campaign.campaignId, status: 'paused' },
-          { status: 'running', nextResumeAt: null }
-        );
-        await queueCampaignRun(campaign.campaignId, 'scheduler_resume');
-      }
-
-      const pending = await Campaign.find({ status: 'pending' }).select('campaignId').lean();
-      for (const campaign of pending) {
-        await queueCampaignRun(campaign.campaignId, 'scheduler_pending');
-      }
-
-      const orphaned = await Campaign.find({
-        status: 'running',
-        runnerLeaseExpiresAt: { $ne: null, $lte: now },
-      }).select('campaignId runnerLeaseExpiresAt').lean();
-      for (const campaign of orphaned) {
-        const reclaimed = await Campaign.updateOne(
-          { campaignId: campaign.campaignId, status: 'running', runnerLeaseExpiresAt: { $lte: now } },
-          { $set: { status: 'pending', runnerLeaseId: null, runnerLeaseExpiresAt: null, lastError: 'Runner lease expired; recovering campaign' } }
-        );
-        if (reclaimed.modifiedCount) {
-          logger.warn('Recovered orphaned campaign runner', { campaignId: campaign.campaignId });
-          await queueCampaignRun(campaign.campaignId, 'scheduler_orphan_recovery');
-        }
-      }
-    } catch (err) {
-      logger.error('Campaign scheduler tick failed', { err });
-    } finally {
-      global[TICK_KEY] = false;
-    }
-  }, 30000);
-  scheduler.timer.unref?.();
-
-  logger.info('Campaign scheduler started');
-}
-
-async function runCampaign(campaignId, trigger = 'manual') {
-  logger.info('Starting campaign runner', { campaignId, trigger });
-  const leaseId = randomUUID();
-  if (!await acquireRunnerLease(campaignId, leaseId)) return;
-  logger.info('Campaign runner lease acquired', { campaignId, leaseId, trigger, leaseMs: RUNNER_LEASE_MS });
-  const heartbeat = startRunnerHeartbeat(campaignId, leaseId);
-  let iteration = 0;
+function parseJsonField(value, label) {
   try {
-   while (iteration < 5000) {
-    iteration += 1;
-    heartbeat.assertOwned();
-    await renewRunnerLease(campaignId, leaseId);
-    const campaign = await Campaign.findOne({ campaignId });
-    if (!campaign) {
-      logger.warn('Campaign not found during run', { campaignId });
-      return;
-    }
-
-    if (!['pending', 'running'].includes(campaign.status)) {
-      logger.info('Campaign status no longer runnable, stopping runner', { campaignId, status: campaign.status });
-      return;
-    }
-
-    const numbers = await buildFormattedNumbers(campaign);
-    if (!numbers.length) {
-      campaign.status = 'error';
-      await campaign.save();
-      logger.error('Campaign has no valid numbers', { campaignId });
-      return;
-    }
-
-    if (campaign.totalNumbers !== numbers.length) {
-      campaign.totalNumbers = numbers.length;
-      if (campaign.currentIndex > numbers.length) {
-        campaign.currentIndex = numbers.length;
-      }
-      await campaign.save();
-    }
-
-    const clientIds = getReadyCampaignClientIds(campaign.selectedClients || []);
-    if (!clientIds.length) {
-      logger.warn('No ready clients available; retrying without pausing campaign', { campaignId });
-      campaign.status = 'running';
-      campaign.lastError = 'Waiting for a selected WhatsApp client to reconnect';
-      await campaign.save();
-      await new Promise((resolve) => setTimeout(resolve, 30000));
-      continue;
-    }
-
-    if (!isWithinSendingHours(campaign.scheduling)) {
-      campaign.status = 'paused';
-      campaign.lastPausedAt = new Date();
-      campaign.nextResumeAt = getNextResumeTime(campaign.scheduling);
-      await campaign.save();
-      logger.info('Campaign paused due to sending hours window', { campaignId, nextResumeAt: campaign.nextResumeAt });
-      return;
-    }
-
-    if (campaign.currentIndex >= numbers.length) {
-      campaign.status = 'completed';
-      campaign.endTime = new Date();
-
-      const totalProcessed = campaign.successCount + campaign.failedCount;
-      const successRecords = campaign.numberReports.filter((report) => report.status === 'success');
-      const averageDeliveryTime = successRecords.length
-        ? successRecords.reduce((sum, report) => sum + (report.deliveryTime || 0), 0) / successRecords.length
-        : 0;
-
-      campaign.summary = {
-        totalProcessed,
-        successRate: totalProcessed ? (campaign.successCount / totalProcessed) * 100 : 0,
-        averageDeliveryTime,
-        messagesDistribution: campaign.messages.map((_, index) => ({
-          messageIndex: index,
-          sentCount: campaign.numberReports.filter(
-            (report) => report.messageIndex === index && report.status === 'success'
-          ).length,
-        })),
-      };
-
-      await campaign.save();
-      logger.info('Campaign completed', { campaignId, totalProcessed });
-      return;
-    }
-
-    campaign.status = 'running';
-    campaign.startTime = campaign.startTime || new Date();
-    await campaign.save();
-
-    const item = numbers[campaign.currentIndex];
-    const selectedClientId = clientIds[Math.floor(Math.random() * clientIds.length)];
-    const client = clients[selectedClientId]?.client;
-    if (!client) {
-      campaign.currentIndex += 1;
-      campaign.failedCount += 1;
-      campaign.processedNumbers += 1;
-      campaign.numberReports.push({
-        number: item.formatted,
-        originalNumber: item.original,
-        messageIndex: 0,
-        messageText: '',
-        status: 'failed',
-        client: selectedClientId,
-        timestamp: new Date(),
-        deliveryTime: 0,
-        errorMessage: 'Client unavailable',
-        attemptNumber: 1,
-      });
-      await campaign.save();
-      continue;
-    }
-
-    const messageIndex = Math.floor(Math.random() * campaign.messages.length);
-    const selectedMessage = campaign.messages[messageIndex];
-    const existingIntent = await MessageHistory.findOne({
-      campaignId, number: item.formatted, source: 'campaign',
-      deliveryStatus: { $in: ['pending', 'unknown', 'delivered'] },
-    }).sort({ createdAt: -1 });
-    if (existingIntent) {
-      if (existingIntent.deliveryStatus !== 'delivered') {
-        campaign.status = 'error';
-        campaign.lastError = 'Message delivery outcome is uncertain; manual review required before resuming';
-        await campaign.save();
-        logger.error('Refusing to resend message with uncertain delivery outcome', { campaignId, number: item.formatted, deliveryStatus: existingIntent.deliveryStatus });
-        return;
-      }
-      campaign.successCount += 1;
-      campaign.processedNumbers += 1;
-      campaign.currentIndex += 1;
-      campaign.numberReports.push({ number: item.formatted, originalNumber: item.original, messageIndex: existingIntent.messageIndex ?? messageIndex, messageText: selectedMessage.text, status: 'success', client: existingIntent.clientUsed, timestamp: existingIntent.updatedAt || new Date(), deliveryTime: existingIntent.deliveryTime || 0, attemptNumber: 1 });
-      await campaign.save();
-      logger.info('Reconciled previously delivered message without resend', { campaignId, number: item.formatted });
-      continue;
-    }
-    const attemptStart = Date.now();
-
-    const messageHistory = new MessageHistory({
-      campaignId,
-      number: item.formatted,
-      originalNumber: item.original,
-      message: selectedMessage.text,
-      messageIndex,
-      deliveryStatus: 'pending',
-      source: 'campaign',
-      clientUsed: selectedClientId,
-      hasMedia: selectedMessage.hasMedia,
-      mediaType: selectedMessage.mediaType,
-      mediaName: selectedMessage.mediaName,
-      sentTime: new Date(),
-    });
-
-    await messageHistory.save();
-
-    try {
-      const chatId = `${item.formatted}@c.us`;
-      const media = selectedMessage.hasMedia && selectedMessage.mediaData
-        ? { data: selectedMessage.mediaData, type: selectedMessage.mediaType, name: selectedMessage.mediaName }
-        : null;
-      const { deliveryTime: measuredDeliveryTime } = await sendWhatsAppMessage({
-        clientId: selectedClientId,
-        chatId,
-        text: selectedMessage.text,
-        media,
-        options: media && selectedMessage.text.trim() ? { caption: selectedMessage.text } : {},
-      });
-
-      const deliveryTime = measuredDeliveryTime || (Date.now() - attemptStart);
-      campaign.successCount += 1;
-      campaign.processedNumbers += 1;
-      campaign.currentIndex += 1;
-      campaign.numberReports.push({
-        number: item.formatted,
-        originalNumber: item.original,
-        messageIndex,
-        messageText: selectedMessage.text,
-        status: 'success',
-        client: selectedClientId,
-        timestamp: new Date(),
-        deliveryTime,
-        attemptNumber: 1,
-      });
-
-      messageHistory.deliveryStatus = 'delivered';
-      messageHistory.deliveryTime = deliveryTime;
-      await messageHistory.save();
-      await campaign.save();
-    } catch (err) {
-      const deliveryTime = Date.now() - attemptStart;
-      if (err?.code === 'NUMBER_NOT_REGISTERED' || err?.code === 'CLIENT_UNAVAILABLE') {
-        // These are confirmed non-deliveries, not ambiguous transport errors.
-        // Advance exactly once and allow the campaign to continue.
-        messageHistory.deliveryStatus = 'failed';
-        messageHistory.deliveryTime = deliveryTime;
-        messageHistory.error = err.message;
-        campaign.failedCount += 1;
-        campaign.processedNumbers += 1;
-        campaign.currentIndex += 1;
-        campaign.numberReports.push({ number: item.formatted, originalNumber: item.original, messageIndex, messageText: selectedMessage.text, status: 'failed', client: selectedClientId, timestamp: new Date(), deliveryTime, errorMessage: err.message, attemptNumber: 1 });
-        await messageHistory.save();
-        await campaign.save();
-        logger.warn('Campaign message failed with confirmed non-delivery; continuing', { campaignId, number: item.formatted, code: err.code });
-        continue;
-      }
-      // A transport failure is not proof that WhatsApp did not accept the message.
-      // Persist uncertainty and stop; recovery must never blindly resend it.
-      messageHistory.deliveryStatus = 'unknown';
-      messageHistory.deliveryTime = deliveryTime;
-      messageHistory.error = err.message;
-      await messageHistory.save();
-      campaign.status = 'error';
-      campaign.lastError = 'Message delivery outcome is uncertain; manual review required before resuming';
-      await campaign.save();
-
-      logger.error('Campaign message send failed', {
-        campaignId,
-        number: item.formatted,
-        clientId: selectedClientId,
-        err,
-      });
-      return;
-    }
-
-    const delayMs = getDelayMs(campaign.delaySettings);
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-  }
-  logger.warn('Campaign runner stopped after iteration cap', { campaignId, trigger, iteration });
-  } finally {
-    heartbeat.stop();
-    await releaseRunnerLease(campaignId, leaseId);
-    logger.info('Campaign runner lease released', { campaignId, leaseId });
+    return JSON.parse(str(value, { max: 100000 }) || 'null');
+  } catch {
+    throw badRequest(`Invalid ${label}`);
   }
 }
 
-async function buildCampaignCsv(campaign, type = 'all') {
-  const formattedNumbers = await buildFormattedNumbers(campaign);
-  const reportByNumber = new Map();
+function boolField(value, fallback) {
+  const v = str(value, { max: 10 });
+  if (v === 'true' || v === '1') return true;
+  if (v === 'false' || v === '0') return false;
+  return fallback;
+}
 
-  for (const report of campaign.numberReports || []) {
-    const key = String(report.number);
-    if (!reportByNumber.has(key)) {
-      reportByNumber.set(key, report);
+async function countValidNumbers(listId, userId) {
+  const list = await ContactList.findOne({ _id: listId, userId }).select('contacts').lean();
+  if (!list) throw new HttpError(404, 'Contact list not found');
+  const unique = new Set();
+  for (const raw of list.contacts || []) {
+    const n = normalizePhone(raw);
+    if (n) unique.add(n);
+  }
+  return unique.size;
+}
+
+/** Validate a create/edit form. Uploads are stored only after validation. */
+async function parseCampaignForm(fields, files, user, existing = null) {
+  const out = {};
+
+  const campaignName = str(fields.campaignName, { max: 120 });
+  if (!campaignName) throw badRequest('Campaign name is required');
+  out.campaignName = campaignName;
+
+  const contactList = str(fields.contactList, { max: 24 });
+  requireObjectId(contactList, 'contact list');
+  out.contactList = contactList;
+  out.totalNumbers = await countValidNumbers(contactList, user.id);
+  if (!out.totalNumbers) throw badRequest('The selected contact list has no valid numbers');
+
+  const selectedClients = parseJsonField(fields.selectedClients, 'profile selection');
+  const profileIds = new Set(getProfileIds());
+  if (!Array.isArray(selectedClients) || !selectedClients.length) throw badRequest('Select at least one WhatsApp profile');
+  if (selectedClients.some((id) => !profileIds.has(id))) throw badRequest('Unknown WhatsApp profile selected');
+  out.selectedClients = [...new Set(selectedClients)];
+
+  const unit = str(fields.delayUnit, { max: 10 }) === 'seconds' ? 'seconds' : 'minutes';
+  const bounds = unit === 'seconds' ? { min: 10, max: 86400 } : { min: 1, max: 1440 };
+  const minDelay = intInRange(fields.minDelay, { ...bounds, fallback: unit === 'seconds' ? 30 : 5 });
+  const maxDelay = intInRange(fields.maxDelay, { ...bounds, fallback: minDelay });
+  if (maxDelay < minDelay) throw badRequest('Maximum delay must be greater than or equal to the minimum delay');
+  out.delaySettings = { minDelay, maxDelay, unit };
+  out.dailyLimit = intInRange(fields.dailyLimit, { min: 0, max: 100000, fallback: 0 });
+
+  const timezone = str(fields.timezone, { max: 60 }) || DEFAULT_TIMEZONE;
+  if (!isValidTimeZone(timezone)) throw badRequest('Invalid time zone');
+  const windowEnabled = boolField(fields.windowEnabled, true);
+  const windowStart = str(fields.windowStart, { max: 5 }) || '09:00';
+  const windowEnd = str(fields.windowEnd, { max: 5 }) || '21:00';
+  if (windowEnabled && (!isValidTime(windowStart) || !isValidTime(windowEnd))) throw badRequest('Sending hours must be in HH:MM format');
+
+  const scheduleDate = str(fields.scheduleDate, { max: 10 });
+  const scheduleTime = str(fields.scheduleTime, { max: 5 }) || '09:00';
+  let startAt = null;
+  if (scheduleDate) {
+    if (!isValidDate(scheduleDate) || !isValidTime(scheduleTime)) throw badRequest('Invalid schedule date or time');
+    startAt = parseZonedDateTime(scheduleDate, scheduleTime, timezone);
+  }
+  out.scheduling = {
+    startAt,
+    startDate: startAt ? new Date(`${scheduleDate}T00:00:00Z`) : null,
+    windowEnabled,
+    startTime: windowEnabled ? windowStart : null,
+    endTime: windowEnabled ? windowEnd : null,
+    timezone,
+    pauseOnEndTime: true,
+    resumeNextDay: true,
+  };
+
+  const messageSpecs = parseJsonField(fields.messages, 'messages');
+  if (!Array.isArray(messageSpecs) || !messageSpecs.length) throw badRequest('Add at least one message');
+  if (messageSpecs.length > MAX_MESSAGES) throw badRequest(`At most ${MAX_MESSAGES} message variations are allowed`);
+
+  const messages = [];
+  for (let i = 0; i < messageSpecs.length; i += 1) {
+    const spec = messageSpecs[i] || {};
+    const text = String(spec.text || '').trim();
+    if (text.length > MAX_TEXT) throw badRequest(`Message ${i + 1} exceeds ${MAX_TEXT} characters`);
+    const message = { text, hasMedia: false };
+
+    if (spec.media === 'new') {
+      const file = firstFile(files, `media${i}`);
+      if (!file) throw badRequest(`Attachment for message ${i + 1} is missing`);
+      message.pendingFile = file;
+      message.hasMedia = true;
+    } else if (spec.media === 'keep') {
+      const source = existing?.messages?.[Number(spec.mediaFrom)];
+      if (!source?.hasMedia) throw badRequest(`Message ${i + 1} refers to an attachment that no longer exists`);
+      Object.assign(message, {
+        hasMedia: true,
+        mediaId: source.mediaId,
+        mediaType: source.mediaType,
+        mediaName: source.mediaName,
+        mediaSize: source.mediaSize,
+        legacyIndex: source.mediaId ? undefined : Number(spec.mediaFrom),
+      });
     }
+
+    if (!message.text && !message.hasMedia) throw badRequest(`Message ${i + 1} needs text or an attachment`);
+    messages.push(message);
   }
 
-  const sentRows = [];
-  const unsentRows = [];
+  for (const message of messages) {
+    if (message.pendingFile) {
+      Object.assign(message, await storeUpload(message.pendingFile, user.id));
+      delete message.pendingFile;
+    }
+  }
+  out.messages = messages;
+  return out;
+}
 
-  for (const pair of formattedNumbers) {
-    const report = reportByNumber.get(pair.formatted);
-    if (report) {
-      sentRows.push([
-        pair.formatted,
-        pair.original,
-        report.status,
-        report.client || '',
-        report.messageIndex != null ? report.messageIndex + 1 : '',
-        report.timestamp ? new Date(report.timestamp).toISOString() : '',
-        report.errorMessage || '',
-      ]);
+/** Legacy campaigns embed base64 media; migrate kept attachments to Media. */
+async function migrateLegacyMedia(messages, campaignId, userId) {
+  if (!messages.some((m) => m.legacyIndex != null)) return messages;
+  const legacy = await Campaign.findOne({ campaignId }).select('messages.mediaData').lean();
+  for (const message of messages) {
+    if (message.legacyIndex == null) continue;
+    const data = legacy?.messages?.[message.legacyIndex]?.mediaData;
+    if (data) {
+      const buffer = Buffer.from(data, 'base64');
+      const doc = await Media.create({
+        userId, name: message.mediaName || 'attachment', mimeType: message.mediaType || 'application/octet-stream',
+        size: buffer.length, sha256: createHash('sha256').update(buffer).digest('hex'), data: buffer,
+      });
+      message.mediaId = doc._id;
+      message.mediaSize = buffer.length;
     } else {
-      unsentRows.push([
-        pair.formatted,
-        pair.original,
-        'not_sent',
-        '',
-        '',
-        '',
-        '',
-      ]);
+      message.hasMedia = false;
     }
+    delete message.legacyIndex;
   }
-
-  const header = [['formatted_number', 'original_number', 'status', 'client', 'message_variant', 'timestamp', 'error']];
-
-  if (type === 'sent') return toCsv([...header, ...sentRows]);
-  if (type === 'unsent') return toCsv([...header, ...unsentRows]);
-  return toCsv([...header, ...sentRows, ...unsentRows]);
+  return messages;
 }
 
-export default async function handler(req, res) {
-  res.setTimeout(120000);
-
-  try {
-    await connectToMongoDB();
-    await ensureSchedulerRunning();
-  } catch (error) {
-    logger.error('MongoDB connection failed', { err: error });
-    return res.status(500).json({ success: false, msg: 'Database connection failed' });
+async function deleteUnreferencedMedia(mediaIds) {
+  for (const id of new Set(mediaIds.filter(Boolean).map(String))) {
+    if (!(await Campaign.exists({ 'messages.mediaId': id }))) await Media.deleteOne({ _id: id });
   }
+}
 
-  let user;
-  try {
-    const auth = await verifyAuth(req);
-    user = auth.user;
-  } catch (err) {
-    return res.status(err.status || 401).json({ success: false, msg: err.msg || 'Unauthorized' });
-  }
+function presentCampaign(campaign) {
+  const startAt = resolveScheduledStart(campaign);
+  const { messages = [], runnerLeaseId, runnerOwner, runnerLeaseExpiresAt, numberReports, ...rest } = campaign;
+  return {
+    ...rest,
+    messages: messages.map(({ mediaData, ...m }) => ({ ...m, hasMedia: !!m.hasMedia })),
+    scheduledStartAt: startAt,
+    isActive: !!runnerLeaseId && runnerLeaseExpiresAt && new Date(runnerLeaseExpiresAt) > new Date(),
+    runningHere: isRunningLocally(campaign.campaignId),
+    clientNames: Object.fromEntries((campaign.selectedClients || []).map((id) => [id, clients[id]?.name || id])),
+  };
+}
 
-  try {
-    if (req.method === 'GET') {
-      const { campaignId, action, type } = req.query;
+async function campaignStats(campaign) {
+  const match = { campaignId: campaign.campaignId, source: 'campaign', runNumber: runFilter(campaign.runNumber || 1) };
+  const [byStatus, replied] = await Promise.all([
+    MessageHistory.aggregate([{ $match: match }, { $group: { _id: '$deliveryStatus', count: { $sum: 1 } } }]),
+    MessageHistory.countDocuments({ ...match, repliedAt: { $ne: null } }),
+  ]);
+  const stats = Object.fromEntries(DELIVERY_STATUSES.map((s) => [s, 0]));
+  for (const row of byStatus) stats[row._id] = row.count;
+  stats.replied = replied;
+  stats.sentTotal = SENT_STATUSES.reduce((sum, s) => sum + stats[s], 0);
+  return stats;
+}
 
-      if (campaignId && action === 'exportCsv') {
-        const campaign = await Campaign.findOne({ campaignId, userId: user.id }).lean();
-        if (!campaign) {
-          return res.status(404).json({ success: false, msg: 'Campaign not found' });
-        }
+async function loadOwned(campaignId, user, projection = '-messages.mediaData') {
+  if (typeof campaignId !== 'string' || !campaignId || campaignId.length > 80) throw badRequest('campaignId is required');
+  const campaign = await Campaign.findOne({ campaignId, userId: user.id }).select(projection);
+  if (!campaign) throw new HttpError(404, 'Campaign not found');
+  return campaign;
+}
 
-        const csv = await buildCampaignCsv(campaign, String(type || 'all'));
-        const fileType = String(type || 'all');
-        const fileName = `${campaignId}_${fileType}.csv`;
+async function exportCsv(res, campaign, type) {
+  const runNumber = campaign.runNumber || 1;
+  startCsvDownload(res, `${campaign.campaignName}_${type}.csv`);
+  res.write(csvRow(['number', 'original_number', 'status', 'profile', 'message_variant', 'sent_at', 'delivered_at', 'read_at', 'replied_at', 'error']));
 
-        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-        return res.status(200).send(csv);
-      }
-
-      if (campaignId) {
-        const campaign = await Campaign.findOne({ campaignId, userId: user.id })
-          .populate('contactList', 'name contacts')
-          .lean();
-
-        if (!campaign) {
-          return res.status(404).json({ success: false, msg: 'Campaign not found' });
-        }
-
-        const scheduledTime = getScheduledTime(campaign);
-        const messageHistory = await MessageHistory.find({
-          source: 'campaign',
-          campaignId,
-        })
-          .sort({ sentTime: -1 })
-          .limit(150)
-          .lean();
-
-        return res.status(200).json({
-          success: true,
-          campaign: {
-            ...campaign,
-            scheduledTime,
-            recentMessages: messageHistory,
-          },
-        });
-      }
-
-      const campaigns = await Campaign.find({ userId: user.id })
-        .select('-messages.mediaData -numberReports')
-        .populate('contactList', 'name')
-        .sort({ createdAt: -1 })
-        .lean();
-
-      const campaignsWithScheduleInfo = campaigns.map((campaign) => ({
-        ...campaign,
-        scheduledTime: getScheduledTime(campaign),
-      }));
-
-      return res.status(200).json({ success: true, campaigns: campaignsWithScheduleInfo });
+  const statusFilter = type === 'sent' ? { $in: SENT_STATUSES } : type === 'failed' ? { $in: ['failed', 'unknown'] } : undefined;
+  const seen = new Set();
+  if (type !== 'unsent') {
+    const cursor = MessageHistory.find({
+      campaignId: campaign.campaignId, source: 'campaign', runNumber: runFilter(runNumber),
+      ...(statusFilter ? { deliveryStatus: statusFilter } : {}),
+    }).sort({ sentTime: 1 }).lean().cursor();
+    for await (const row of cursor) {
+      seen.add(row.number);
+      res.write(csvRow([row.number, row.originalNumber, row.deliveryStatus, clients[row.clientUsed]?.name || row.clientUsed, row.messageIndex != null ? row.messageIndex + 1 : '', row.sentTime, row.deliveredAt, row.readAt, row.repliedAt, row.error]));
     }
+  }
+  if (type === 'all' || type === 'unsent') {
+    if (type === 'unsent') {
+      const sent = await MessageHistory.distinct('number', { campaignId: campaign.campaignId, source: 'campaign', runNumber: runFilter(runNumber) });
+      sent.forEach((n) => seen.add(n));
+    }
+    const list = await ContactList.findById(campaign.contactList).select('contacts').lean();
+    for (const raw of list?.contacts || []) {
+      const number = normalizePhone(raw);
+      if (!number || seen.has(number)) continue;
+      seen.add(number);
+      res.write(csvRow([number, raw, 'not_sent', '', '', '', '', '', '', '']));
+    }
+  }
+  res.end();
+}
 
-    if (req.method === 'POST') {
-      const { fields, files } = await Promise.race([
-        parseForm(req),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Form parsing timeout')), 30000)),
-      ]);
+async function handleGet(req, res, user) {
+  const { campaignId, action } = req.query;
 
-      const campaignName = getFieldValue(fields.campaignName).trim();
-      const contactListId = getFieldValue(fields.contactList);
-      const selectedClientsRaw = getFieldValue(fields.selectedClients) || '[]';
-      const minDelayRaw = getFieldValue(fields.minDelay) || '5';
-      const maxDelayRaw = getFieldValue(fields.maxDelay) || '25';
-      const startDate = getFieldValue(fields.startDate);
-      const startTime = getFieldValue(fields.startTime) || '07:00';
-      const endTime = getFieldValue(fields.endTime) || '21:00';
-      const action = getFieldValue(fields.action) || req.query.action;
-      const targetCampaignId = getFieldValue(fields.campaignId) || req.query.campaignId;
+  if (!campaignId) {
+    const campaigns = await Campaign.find({ userId: user.id })
+      .select('-messages.mediaData')
+      .populate('contactList', 'name')
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .lean();
+    return res.status(200).json({ success: true, campaigns: campaigns.map(presentCampaign) });
+  }
 
-      const messages = [];
-      // Edit requests use the existing campaign messages as their source of
-      // truth. Do not read/delete upload temp files in the create path first;
-      // the edit path below must be the only consumer of those files.
-      if (!(action === 'edit' && targetCampaignId)) for (let i = 1; i <= 4; i++) {
-        const messageText = getFieldValue(fields[`message${i}`]);
-        if (!messageText || !messageText.trim()) continue;
+  const campaign = (await loadOwned(campaignId, user)).toObject();
 
-        const messageObj = {
-          text: messageText.trim(),
-          hasMedia: false,
-          mediaType: null,
-          mediaName: null,
-          mediaData: null,
-        };
+  if (action === 'exportCsv') {
+    const type = ['all', 'sent', 'failed', 'unsent'].includes(req.query.type) ? req.query.type : 'all';
+    return exportCsv(res, campaign, type);
+  }
 
-        const mediaFile = files[`media${i}`];
-        if (mediaFile) {
-          try {
-            const fileObj = Array.isArray(mediaFile) ? mediaFile[0] : mediaFile;
-            const allowedMimes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/jpg'];
-            if (allowedMimes.includes(fileObj.mimetype) && fileObj.size < 10 * 1024 * 1024) {
-              const mediaBuffer = fs.readFileSync(fileObj.filepath);
-              messageObj.hasMedia = true;
-              messageObj.mediaType = fileObj.mimetype;
-              messageObj.mediaName = fileObj.originalFilename;
-              messageObj.mediaData = mediaBuffer.toString('base64');
-            }
+  if (action === 'messages') {
+    const page = intInRange(req.query.page, { min: 1, max: 100000, fallback: 1 });
+    const limit = intInRange(req.query.limit, { min: 5, max: 100, fallback: 25 });
+    const filter = { campaignId, source: 'campaign', runNumber: runFilter(campaign.runNumber || 1) };
+    if (DELIVERY_STATUSES.includes(req.query.status)) filter.deliveryStatus = req.query.status;
+    if (req.query.status === 'replied') filter.repliedAt = { $ne: null };
+    const [total, messages] = await Promise.all([
+      MessageHistory.countDocuments(filter),
+      MessageHistory.find(filter).sort({ sentTime: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    ]);
+    return res.status(200).json({ success: true, messages, total, page, pages: Math.max(1, Math.ceil(total / limit)) });
+  }
 
-            try {
-              fs.unlinkSync(fileObj.filepath);
-            } catch {
-              // ignore cleanup failure
-            }
-          } catch (fileError) {
-            logger.warn('Error processing media file', { index: i, err: fileError });
-          }
-        }
+  await Campaign.populate(campaign, { path: 'contactList', select: 'name' });
+  const [stats, review] = await Promise.all([
+    campaignStats(campaign),
+    campaign.status === 'needs_review' && campaign.review?.historyId ? MessageHistory.findById(campaign.review.historyId).lean() : null,
+  ]);
+  return res.status(200).json({ success: true, campaign: presentCampaign(campaign), stats, reviewMessage: review });
+}
 
-        messages.push(messageObj);
-      }
+async function handleCreate(req, res, user, logger) {
+  const { fields, files } = await parseMultipart(req, { maxFileSize: MAX_MEDIA_BYTES, maxFiles: MAX_MESSAGES });
+  try {
+    const input = await parseCampaignForm(fields, files, user);
+    const { totalNumbers } = input;
 
-      let selectedClients = [];
-      try {
-        selectedClients = JSON.parse(selectedClientsRaw);
-      } catch {
-        return res.status(400).json({ success: false, msg: 'Invalid client selection data' });
-      }
+    const draft = boolField(fields.saveAsDraft, false);
+    const startAt = input.scheduling.startAt;
+    const status = draft ? 'draft' : startAt && startAt > new Date() ? 'scheduled' : 'pending';
+    const campaignId = generateCampaignId();
 
-      const minDelay = parseInt(minDelayRaw, 10) || 5;
-      const maxDelay = parseInt(maxDelayRaw, 10) || 25;
+    await Campaign.create({ ...input, campaignId, userId: user.id, status, totalNumbers });
+    if (status === 'pending') queueCampaignRun(campaignId, 'created');
+    logger.info('Campaign created', { campaignId, status, totalNumbers });
+    return res.status(201).json({ success: true, campaignId, status, totalNumbers });
+  } finally {
+    await cleanupTempFiles(files);
+  }
+}
 
-      if (action === 'edit' && targetCampaignId) {
-        const campaign = await Campaign.findOne({ campaignId: targetCampaignId, userId: user.id });
-        if (!campaign) {
-          return res.status(404).json({ success: false, msg: 'Campaign not found' });
-        }
+async function handleEdit(req, res, user, logger) {
+  const campaign = await loadOwned(req.query.campaignId, user, '');
+  const { fields, files } = await parseMultipart(req, { maxFileSize: MAX_MEDIA_BYTES, maxFiles: MAX_MESSAGES });
+  try {
+    const input = await parseCampaignForm(fields, files, user, campaign.toObject());
+    if (String(input.contactList) !== String(campaign.contactList) && campaign.processedNumbers > 0) {
+      throw new HttpError(409, 'This campaign has already sent messages. Duplicate it to target a different contact list.');
+    }
+    input.messages = await migrateLegacyMedia(input.messages, campaign.campaignId, user.id);
+    const previousMedia = campaign.messages.map((m) => m.mediaId);
 
-        if (campaignName) {
-          campaign.campaignName = campaignName;
-        }
+    const update = { ...input };
+    if (campaign.status === 'scheduled' && (!input.scheduling.startAt || input.scheduling.startAt <= new Date())) update.status = 'pending';
+    if (['pending', 'draft', 'stopped'].includes(campaign.status) && input.scheduling.startAt > new Date()) update.status = 'scheduled';
 
-        if (contactListId && String(contactListId) !== String(campaign.contactList)) {
-          const contactList = await ContactList.findOne({ _id: contactListId, userId: user.id }).lean();
-          if (contactList) {
-            campaign.contactList = contactListId;
-            const updatedNumbers = (contactList.contacts || [])
-              .map((num) => ({ original: num, formatted: formatIndianNumber(num) }))
-              .filter((pair) => pair.formatted.length >= 10);
-            campaign.totalNumbers = updatedNumbers.length;
-            if (campaign.currentIndex > campaign.totalNumbers) {
-              campaign.currentIndex = campaign.totalNumbers;
-            }
-          }
-        }
+    // Replace messages wholesale; also drops any legacy embedded base64.
+    await Campaign.updateOne({ _id: campaign._id }, { $set: update });
+    await deleteUnreferencedMedia(previousMedia);
 
-        const updatedMessages = [];
-        for (let i = 1; i <= 4; i++) {
-          const messageText = getFieldValue(fields[`message${i}`]);
-          if (!messageText || !messageText.trim()) continue;
+    const status = update.status || campaign.status;
+    if (status === 'pending' || status === 'running') queueCampaignRun(campaign.campaignId, 'edited');
+    wakeCampaign(campaign.campaignId);
+    logger.info('Campaign updated', { campaignId: campaign.campaignId });
+    return res.status(200).json({ success: true, status });
+  } finally {
+    await cleanupTempFiles(files);
+  }
+}
 
-          const existingMsg = campaign.messages && campaign.messages[i - 1];
-          const removeMedia = getFieldValue(fields[`removeMedia${i}`]) === 'true';
-          const mediaFile = files[`media${i}`];
+async function setStatus(campaign, fromStatuses, set, errorMsg) {
+  const result = await Campaign.updateOne({ _id: campaign._id, status: { $in: fromStatuses } }, set);
+  if (!result.matchedCount) throw new HttpError(409, errorMsg || `Cannot do that while the campaign is ${campaign.status}`);
+}
 
-          let messageObj = {
-            text: messageText.trim(),
-            hasMedia: existingMsg ? !!existingMsg.hasMedia : false,
-            mediaType: existingMsg ? existingMsg.mediaType || null : null,
-            mediaName: existingMsg ? existingMsg.mediaName || null : null,
-            mediaData: existingMsg ? existingMsg.mediaData || null : null,
-          };
+async function handlePatch(req, res, user, logger) {
+  const body = await readJsonBody(req);
+  const campaign = await loadOwned(req.query.campaignId, user);
+  const { campaignId } = campaign;
+  const action = body.action;
+  let message = 'Campaign updated';
 
-          if (removeMedia) {
-            messageObj.hasMedia = false;
-            messageObj.mediaType = null;
-            messageObj.mediaName = null;
-            messageObj.mediaData = null;
-          }
+  switch (action) {
+    case 'pause':
+      await setStatus(campaign, ['running', 'pending', 'paused'], { $set: { status: 'paused', pauseReason: 'manual', lastPausedAt: new Date(), nextResumeAt: null, lastError: null } });
+      message = 'Campaign paused';
+      break;
 
-          if (mediaFile) {
-            try {
-              const fileObj = Array.isArray(mediaFile) ? mediaFile[0] : mediaFile;
-              const allowedMimes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/jpg'];
-              if (allowedMimes.includes(fileObj.mimetype) && fileObj.size < 10 * 1024 * 1024) {
-                const mediaBuffer = fs.readFileSync(fileObj.filepath);
-                messageObj.hasMedia = true;
-                messageObj.mediaType = fileObj.mimetype;
-                messageObj.mediaName = fileObj.originalFilename;
-                messageObj.mediaData = mediaBuffer.toString('base64');
-              }
-              try { fs.unlinkSync(fileObj.filepath); } catch {}
-            } catch (err) {
-              logger.warn('Error processing updated media file', { index: i, err });
-            }
-          }
+    case 'resume':
+    case 'start':
+      await setStatus(campaign, ['paused', 'stopped', 'error', 'scheduled', 'draft'], { $set: { status: 'pending', pauseReason: null, nextResumeAt: null, lastError: null } },
+        campaign.status === 'needs_review' ? 'Resolve the review item first' : campaign.status === 'completed' ? 'Campaign is complete. Use Run again.' : undefined);
+      queueCampaignRun(campaignId, 'resume');
+      message = 'Campaign started';
+      break;
 
-          updatedMessages.push(messageObj);
-        }
+    case 'stop':
+      await setStatus(campaign, ['running', 'pending', 'paused', 'scheduled', 'needs_review', 'error', 'draft'], { $set: { status: 'stopped', endTime: new Date(), nextResumeAt: null, lastError: null } });
+      message = 'Campaign stopped';
+      break;
 
-        if (updatedMessages.length) {
-          campaign.messages = updatedMessages;
-        }
-
-        if (Array.isArray(selectedClients) && selectedClients.length) {
-          const readyClients = getReadyCampaignClientIds(selectedClients);
-          if (readyClients.length) {
-            campaign.selectedClients = readyClients;
-          }
-        }
-
-        campaign.delaySettings = {
-          minDelay: Math.max(1, minDelay),
-          maxDelay: Math.max(Math.max(1, minDelay), maxDelay),
-        };
-
-        campaign.scheduling = {
-          ...campaign.scheduling,
-          startDate: startDate ? new Date(startDate) : campaign.scheduling?.startDate,
-          startTime: startTime || campaign.scheduling?.startTime,
-          endTime: endTime || campaign.scheduling?.endTime,
-        };
-
-        await campaign.save();
-
-        if (campaign.status === 'pending' || campaign.status === 'running') {
-          await queueCampaignRun(targetCampaignId, 'edited_resume');
-        }
-
-        return res.status(200).json({ success: true, msg: 'Campaign updated successfully', campaign });
-      }
-
-      if (!campaignName) {
-        return res.status(400).json({ success: false, msg: 'Campaign name is required' });
-      }
-      if (!contactListId) {
-        return res.status(400).json({ success: false, msg: 'Contact list selection is required' });
-      }
-      if (!messages.length) {
-        return res.status(400).json({ success: false, msg: 'At least one message is required' });
-      }
-      if (!Array.isArray(selectedClients) || !selectedClients.length) {
-        return res.status(400).json({ success: false, msg: 'At least one WhatsApp client must be selected' });
-      }
-
-      const contactList = await ContactList.findOne({ _id: contactListId, userId: user.id }).lean();
-      if (!contactList) {
-        return res.status(404).json({ success: false, msg: 'Contact list not found' });
-      }
-
-      const formattedNumbers = (contactList.contacts || [])
-        .map((number) => ({ original: number, formatted: formatIndianNumber(number) }))
-        .filter((pair) => pair.formatted.length >= 10);
-
-      if (!formattedNumbers.length) {
-        return res.status(400).json({ success: false, msg: 'No valid phone numbers in contact list' });
-      }
-
-      const readyClients = getReadyCampaignClientIds(selectedClients);
-      if (!readyClients.length) {
-        return res.status(400).json({ success: false, msg: 'No selected clients are ready for messaging' });
-      }
-
-      const campaignId = generateCampaignId();
-      const scheduledStartTime = startDate ? new Date(`${startDate}T${startTime}:00+05:30`) : new Date();
-      const status = startDate && scheduledStartTime > new Date() ? 'scheduled' : 'pending';
-
-      const newCampaign = new Campaign({
-        campaignId,
-        campaignName,
-        userId: user.id,
-        contactList: contactListId,
-        messages,
-        selectedClients: readyClients,
-        delaySettings: { minDelay, maxDelay },
-        scheduling: {
-          startDate: startDate ? new Date(startDate) : null,
-          startTime,
-          endTime,
-          pauseOnEndTime: true,
-          resumeNextDay: true,
+    case 'rerun':
+      // Clearing the lease detaches any live runner so its late updates
+      // cannot touch the new run's counters.
+      await Campaign.updateOne({ _id: campaign._id }, {
+        $set: {
+          status: 'pending', startTime: null, endTime: null, lastPausedAt: null, nextResumeAt: null, pauseReason: null,
+          currentIndex: 0, processedNumbers: 0, successCount: 0, failedCount: 0, skippedCount: 0, dailyCount: 0,
+          lastError: null, runnerLeaseId: null, runnerLeaseExpiresAt: null,
+          summary: { totalProcessed: 0, successRate: 0, averageDeliveryTime: 0, messagesDistribution: [] },
         },
-        status,
-        totalNumbers: formattedNumbers.length,
-        processedNumbers: 0,
-        successCount: 0,
-        failedCount: 0,
-        currentIndex: 0,
-        numberReports: [],
+        $inc: { runNumber: 1 },
+        $unset: { numberReports: '', review: '' },
       });
+      wakeCampaign(campaignId);
+      queueCampaignRun(campaignId, 'rerun');
+      message = 'Campaign restarted from the beginning';
+      break;
 
-      await newCampaign.save();
-
-      if (status === 'pending') {
-        await queueCampaignRun(campaignId, 'created_pending');
-      }
-
-      return res.status(201).json({
-        success: true,
-        msg: 'Campaign created successfully',
-        campaignId,
-        totalNumbers: formattedNumbers.length,
-        messagesCount: messages.length,
-        activeClients: readyClients.length,
-        status,
+    case 'reschedule': {
+      const date = str(body.date, { max: 10 });
+      const time = str(body.time, { max: 5 });
+      if (!isValidDate(date) || !isValidTime(time)) throw badRequest('Enter a valid date and time');
+      const startAt = parseZonedDateTime(date, time, campaign.scheduling?.timezone || DEFAULT_TIMEZONE);
+      const status = startAt > new Date() ? 'scheduled' : 'pending';
+      await setStatus(campaign, ['scheduled', 'pending', 'paused', 'stopped', 'error', 'draft'], {
+        $set: { status, 'scheduling.startAt': startAt, 'scheduling.startDate': new Date(`${date}T00:00:00Z`), nextResumeAt: null, pauseReason: null },
       });
+      if (status === 'pending') queueCampaignRun(campaignId, 'reschedule');
+      message = status === 'scheduled' ? 'Campaign rescheduled' : 'Scheduled time has passed; campaign started';
+      break;
     }
 
-    if (req.method === 'PATCH') {
-      const { campaignId } = req.query;
-      const parsedBody = await new Promise((resolve, reject) => {
-        let body = '';
-        req.on('data', (chunk) => {
-          body += chunk.toString();
+    case 'resolve': {
+      if (campaign.status !== 'needs_review') throw new HttpError(409, 'Nothing to review');
+      const mode = body.mode;
+      const historyId = campaign.review?.historyId;
+      if (mode === 'mark_sent') {
+        if (historyId) await MessageHistory.updateOne({ _id: historyId, deliveryStatus: { $in: ['pending', 'unknown'] } }, { $set: { deliveryStatus: 'sent', error: 'Marked as sent after review' } });
+        await setStatus(campaign, ['needs_review'], { $set: { status: 'pending', lastError: null }, $unset: { review: '' } });
+      } else if (mode === 'resend') {
+        if (historyId) await MessageHistory.updateOne({ _id: historyId }, { $set: { deliveryStatus: 'failed', error: 'Outcome uncertain; resent after review' } });
+        await setStatus(campaign, ['needs_review'], { $set: { status: 'pending', lastError: null }, $unset: { review: '' } });
+      } else if (mode === 'skip') {
+        if (historyId) await MessageHistory.updateOne({ _id: historyId }, { $set: { deliveryStatus: 'failed', error: 'Outcome uncertain; skipped after review' } });
+        await setStatus(campaign, ['needs_review'], {
+          $set: { status: 'pending', lastError: null },
+          $unset: { review: '' },
+          $inc: { currentIndex: 1, processedNumbers: 1, failedCount: 1 },
         });
-        req.on('end', () => {
-          try {
-            resolve(JSON.parse(body || '{}'));
-          } catch (err) {
-            reject(err);
-          }
-        });
-      }).catch(() => null);
-
-      if (!campaignId) {
-        return res.status(400).json({ success: false, msg: 'campaignId required' });
+      } else {
+        throw badRequest('Choose mark_sent, resend or skip');
       }
-      if (!parsedBody) {
-        return res.status(400).json({ success: false, msg: 'Invalid JSON in request body' });
-      }
+      queueCampaignRun(campaignId, 'review_resolved');
+      message = 'Review resolved; campaign continuing';
+      break;
+    }
 
-      const { action } = parsedBody;
-      if (!action) {
-        return res.status(400).json({ success: false, msg: 'action field required in request body' });
-      }
-
-      const campaign = await Campaign.findOne({ campaignId, userId: user.id });
-      if (!campaign) {
-        return res.status(404).json({ success: false, msg: 'Campaign not found' });
-      }
-
-      if (action === 'edit') {
-        const {
-          campaignName,
-          contactList,
-          messages,
-          delaySettings,
-          scheduling,
-          selectedClients,
-          status,
-        } = parsedBody;
-
-        if (campaignName && String(campaignName).trim()) {
-          campaign.campaignName = String(campaignName).trim();
-        }
-
-        if (contactList && String(contactList) !== String(campaign.contactList)) {
-          const nextContactList = await ContactList.findOne({ _id: contactList, userId: user.id }).lean();
-          if (!nextContactList) {
-            return res.status(400).json({ success: false, msg: 'Invalid contact list for this user' });
-          }
-
-          campaign.contactList = contactList;
-          const updatedNumbers = (nextContactList.contacts || [])
-            .map((num) => ({ original: num, formatted: formatIndianNumber(num) }))
-            .filter((pair) => pair.formatted.length >= 10);
-          campaign.totalNumbers = updatedNumbers.length;
-
-          if (campaign.currentIndex > campaign.totalNumbers) {
-            campaign.currentIndex = campaign.totalNumbers;
-          }
-        }
-
-        if (messages && Array.isArray(messages) && messages.length) {
-          const updatedMessages = messages
-            .filter((item) => (typeof item === 'string' ? item.trim() : item?.text?.trim()))
-            .slice(0, 4)
-            .map((item, idx) => {
-              const newText = typeof item === 'string' ? item.trim() : String(item.text).trim();
-              const existingMsg = campaign.messages && campaign.messages[idx];
-
-              // If new media was explicitly passed or media was explicitly removed:
-              if (typeof item === 'object' && item.mediaData !== undefined) {
-                return {
-                  text: newText,
-                  hasMedia: !!item.hasMedia,
-                  mediaType: item.mediaType || null,
-                  mediaName: item.mediaName || null,
-                  mediaData: item.mediaData || null,
-                };
-              }
-
-              // Otherwise preserve existing message's media attachments
-              return {
-                text: newText,
-                hasMedia: existingMsg ? !!existingMsg.hasMedia : false,
-                mediaType: existingMsg ? existingMsg.mediaType || null : null,
-                mediaName: existingMsg ? existingMsg.mediaName || null : null,
-                mediaData: existingMsg ? existingMsg.mediaData || null : null,
-              };
-            });
-
-          if (!updatedMessages.length) {
-            return res.status(400).json({ success: false, msg: 'At least one valid message is required' });
-          }
-
-          campaign.messages = updatedMessages;
-        }
-
-        if (delaySettings) {
-          const minDelay = parseInt(delaySettings.minDelay, 10) || 5;
-          const maxDelay = parseInt(delaySettings.maxDelay, 10) || 25;
-          campaign.delaySettings = {
-            minDelay: Math.max(1, minDelay),
-            maxDelay: Math.max(Math.max(1, minDelay), maxDelay),
-          };
-        }
-
-        if (scheduling) {
-          campaign.scheduling = {
-            ...campaign.scheduling,
-            ...scheduling,
-            startDate: scheduling.startDate ? new Date(scheduling.startDate) : scheduling.startDate === null ? null : campaign.scheduling?.startDate,
-          };
-        }
-
-        if (selectedClients && Array.isArray(selectedClients)) {
-          const readyClients = getReadyCampaignClientIds(selectedClients);
-          if (!readyClients.length) {
-            return res.status(400).json({ success: false, msg: 'At least one ready client must remain selected' });
-          }
-          campaign.selectedClients = readyClients;
-        }
-
-        if (status && ['pending', 'paused', 'scheduled', 'running', 'completed', 'stopped'].includes(status)) {
-          campaign.status = status;
-        }
-
-        await campaign.save();
-        if (campaign.status === 'pending' || campaign.status === 'running') {
-          await queueCampaignRun(campaignId, 'edited_resume');
-        }
-
-        return res.status(200).json({ success: true, msg: 'Campaign updated successfully', campaign });
-      }
-
-      if (action === 'pause') {
-        if (campaign.status !== 'running') {
-          return res.status(400).json({ success: false, msg: `Cannot pause campaign with status: ${campaign.status}` });
-        }
-
-        campaign.status = 'paused';
-        campaign.lastPausedAt = new Date();
-        await campaign.save();
-        return res.status(200).json({ success: true, msg: 'Campaign paused successfully' });
-      }
-
-      if (action === 'resume') {
-        if (!['paused', 'pending', 'scheduled', 'completed', 'stopped'].includes(campaign.status)) {
-          return res.status(400).json({ success: false, msg: `Cannot resume campaign with status: ${campaign.status}` });
-        }
-
-        if (['completed', 'stopped'].includes(campaign.status)) {
-          campaign.status = 'pending';
-        } else {
-          campaign.status = 'running';
-        }
-
-        campaign.nextResumeAt = null;
-        await campaign.save();
-        await queueCampaignRun(campaignId, 'resume_action');
-
-        return res.status(200).json({ success: true, msg: 'Campaign resumed successfully' });
-      }
-
-      if (action === 'stop') {
-        if (!['running', 'paused', 'scheduled', 'pending'].includes(campaign.status)) {
-          return res.status(400).json({ success: false, msg: `Cannot stop campaign with status: ${campaign.status}` });
-        }
-
-        campaign.status = 'stopped';
-        campaign.endTime = new Date();
-        await campaign.save();
-        return res.status(200).json({ success: true, msg: 'Campaign stopped successfully' });
-      }
-
-      if (action === 'rerun') {
-        campaign.status = 'pending';
-        campaign.startTime = null;
-        campaign.endTime = null;
-        campaign.lastPausedAt = null;
-        campaign.nextResumeAt = null;
-        campaign.currentIndex = 0;
-        campaign.processedNumbers = 0;
-        campaign.successCount = 0;
-        campaign.failedCount = 0;
-        campaign.numberReports = [];
-        campaign.summary = {
-          totalProcessed: 0,
-          successRate: 0,
-          averageDeliveryTime: 0,
-          messagesDistribution: [],
-        };
-
-        await MessageHistory.deleteMany({ campaignId: campaign.campaignId, source: 'campaign' });
-        await campaign.save();
-        await queueCampaignRun(campaignId, 'rerun_action');
-
-        return res.status(200).json({ success: true, msg: 'Campaign reset and rerun started' });
-      }
-
-      if (action === 'reschedule') {
-        const { startDate, startTime, endTime } = parsedBody;
-        if (!startDate || !startTime) {
-          return res.status(400).json({ success: false, msg: 'startDate and startTime are required for reschedule' });
-        }
-
-        const scheduledStartTime = new Date(`${startDate}T${startTime}:00+05:30`);
-        campaign.scheduling = {
-          ...campaign.scheduling,
-          startDate: new Date(startDate),
-          startTime,
-          endTime: endTime || campaign.scheduling?.endTime || '21:00',
-        };
-
-        campaign.status = scheduledStartTime > new Date() ? 'scheduled' : 'pending';
-        campaign.nextResumeAt = null;
-        await campaign.save();
-
-        if (campaign.status === 'pending') {
-          await queueCampaignRun(campaignId, 'reschedule_immediate');
-        }
-
-        return res.status(200).json({
-          success: true,
-          msg: campaign.status === 'scheduled' ? 'Campaign rescheduled' : 'Campaign scheduled time already passed, started now',
-        });
-      }
-
-      return res.status(400).json({
-        success: false,
-        msg: `Invalid action: ${action}. Valid actions: edit, pause, resume, stop, rerun, reschedule`,
+    case 'duplicate': {
+      const source = await Campaign.findById(campaign._id).lean();
+      const messages = await migrateLegacyMedia(
+        source.messages.map(({ mediaData, ...m }, i) => ({ ...m, legacyIndex: m.hasMedia && !m.mediaId ? i : undefined })),
+        campaignId, user.id
+      );
+      const copyId = generateCampaignId();
+      await Campaign.create({
+        campaignId: copyId,
+        campaignName: `${source.campaignName} (copy)`.slice(0, 120),
+        userId: user.id,
+        contactList: source.contactList,
+        messages,
+        scheduling: { ...source.scheduling, startAt: null, startDate: null },
+        selectedClients: source.selectedClients,
+        delaySettings: source.delaySettings,
+        dailyLimit: source.dailyLimit || 0,
+        totalNumbers: source.totalNumbers,
+        status: 'draft',
       });
+      logger.info('Campaign duplicated', { from: campaignId, to: copyId });
+      return res.status(201).json({ success: true, msg: 'Campaign duplicated as a draft', campaignId: copyId });
     }
 
-    if (req.method === 'DELETE') {
-      const { campaignId } = req.query;
-      if (!campaignId) {
-        return res.status(400).json({ success: false, msg: 'campaignId required' });
-      }
-
-      const deleted = await Campaign.findOneAndDelete({ campaignId, userId: user.id });
-      if (!deleted) {
-        return res.status(404).json({ success: false, msg: 'Campaign not found' });
-      }
-
-      await MessageHistory.deleteMany({ campaignId, source: 'campaign' });
-      return res.status(200).json({ success: true, msg: 'Campaign deleted successfully' });
-    }
-
-    return res.status(405).json({ success: false, msg: `Method ${req.method} not allowed` });
-  } catch (error) {
-    logger.error('Campaign API error', { err: error });
-    return res.status(500).json({
-      success: false,
-      msg: 'Internal server error',
-      details: error.message,
-    });
+    default:
+      throw badRequest('Unknown action');
   }
+
+  wakeCampaign(campaignId);
+  logger.info('Campaign action', { campaignId, action });
+  return res.status(200).json({ success: true, msg: message });
 }
+
+async function handleDelete(req, res, user, logger) {
+  const campaign = await loadOwned(req.query.campaignId, user);
+  const deleteHistory = req.query.deleteHistory === '1';
+  await Campaign.deleteOne({ _id: campaign._id });
+  wakeCampaign(campaign.campaignId);
+  if (deleteHistory) await MessageHistory.deleteMany({ campaignId: campaign.campaignId, source: 'campaign' });
+  await deleteUnreferencedMedia(campaign.messages.map((m) => m.mediaId));
+  logger.info('Campaign deleted', { campaignId: campaign.campaignId, deleteHistory });
+  return res.status(200).json({ success: true, msg: 'Campaign deleted' });
+}
+
+export default withApi(async (req, res, { user, logger }) => {
+  switch (req.method) {
+    case 'GET':
+      return handleGet(req, res, user);
+    case 'POST':
+      return handleCreate(req, res, user, logger);
+    case 'PUT':
+      return handleEdit(req, res, user, logger);
+    case 'PATCH':
+      return handlePatch(req, res, user, logger);
+    case 'DELETE':
+      return handleDelete(req, res, user, logger);
+    default:
+      throw new HttpError(405, 'Method not allowed');
+  }
+}, { methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], name: 'campaigns' });

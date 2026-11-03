@@ -1,87 +1,41 @@
-import jwt from 'jsonwebtoken';
-import { serialize } from 'cookie';
+import { authConfigError, createSessionToken, getAdminProfile, isSameOrigin, safeEqual, sessionCookies } from '@/lib/auth';
+import { HttpError, withApi } from '@/lib/api';
+import { checkRateLimit, getClientIp, peekRateLimit, resetRateLimit } from '@/lib/rateLimit';
 
-const handler = async (req, res) => {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ success: false, msg: 'Method not allowed.' });
+const FAILURE_LIMIT = { limit: 8, windowMs: 15 * 60 * 1000 };
+
+export default withApi(async (req, res, { logger }) => {
+  if (!isSameOrigin(req)) throw new HttpError(403, 'Cross-site request blocked');
+
+  const configError = authConfigError();
+  if (configError) {
+    logger.error(`Login unavailable: ${configError}`);
+    throw new HttpError(503, 'Sign-in is not configured on the server.');
   }
 
-  try {
-    const { username, password } = req.body || {};
-
-    // Input Validation
-    if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
-      return res.status(400).json({ success: false, msg: 'Please provide valid credentials.' });
-    }
-
-    const trimmedUser = username.trim();
-    const trimmedPass = password.trim();
-
-    const envUser = process.env.ADMIN_USERNAME?.trim();
-    const envPass = process.env.ADMIN_PASSWORD?.trim();
-    const jwtSecret = process.env.JWT_TOKEN_ADMIN?.trim();
-
-    if (!envUser || !envPass || !jwtSecret) {
-      console.error('Login configuration is incomplete.');
-      return res.status(500).json({
-        success: false,
-        msg: 'Server authentication is not configured.',
-      });
-    }
-
-    const isValid = (
-      (trimmedUser.toLowerCase() === envUser.toLowerCase() && trimmedPass === envPass) ||
-      (trimmedUser.toLowerCase() === 'admin' && trimmedPass === envPass)
-    );
-
-    if (isValid) {
-      const adminPayload = {
-        id: 'admin',
-        role: 'admin',
-        name: 'Workspace Administrator',
-        email: process.env.ADMIN_EMAIL || 'admin@whatmot.com',
-        username: envUser || trimmedUser,
-        loginTime: new Date().toISOString(),
-      };
-
-      const token = jwt.sign(adminPayload, jwtSecret, {
-        expiresIn: '30d',
-      });
-
-      // Set cookie
-      res.setHeader(
-        'Set-Cookie',
-        serialize('token', token, {
-          httpOnly: true,
-          secure: process.env.NODE_ENV === 'production',
-          sameSite: 'lax',
-          path: '/',
-          maxAge: 60 * 60 * 24 * 30, // 30 days
-        })
-      );
-
-      return res.status(200).json({
-        success: true,
-        msg: 'Admin login successful! Welcome back.',
-        user: adminPayload,
-        token,
-      });
-    }
-
-    // Invalid credentials
-    return res.status(401).json({
-      success: false,
-      msg: 'Invalid credentials. Please check your username and password.',
-    });
-
-  } catch (err) {
-    console.error('Login error:', err);
-    return res.status(500).json({
-      success: false,
-      msg: 'Server error occurred. Please try again later.',
-    });
+  const ip = getClientIp(req);
+  const key = `login:${ip}`;
+  const blocked = peekRateLimit(key, FAILURE_LIMIT);
+  if (blocked.blocked) {
+    res.setHeader('Retry-After', String(blocked.retryAfterSec));
+    throw new HttpError(429, `Too many failed attempts. Try again in ${Math.ceil(blocked.retryAfterSec / 60)} minute(s).`);
   }
-};
 
-export default handler;
+  const { username, password } = req.body || {};
+  if (typeof username !== 'string' || typeof password !== 'string' || !username.trim() || !password || username.length > 200 || password.length > 500) {
+    throw new HttpError(400, 'Enter your username and password.');
+  }
 
+  const userOk = safeEqual(username.trim().toLowerCase(), process.env.ADMIN_USERNAME.trim().toLowerCase());
+  const passOk = safeEqual(password, process.env.ADMIN_PASSWORD);
+  if (!(userOk && passOk)) {
+    checkRateLimit(key, FAILURE_LIMIT);
+    logger.warn('Failed sign-in attempt', { ip });
+    throw new HttpError(401, 'Incorrect username or password.');
+  }
+
+  resetRateLimit(key);
+  res.setHeader('Set-Cookie', sessionCookies(req, createSessionToken()));
+  logger.info('Administrator signed in', { ip });
+  return res.status(200).json({ success: true, user: getAdminProfile() });
+}, { methods: ['POST'], auth: false, db: false, name: 'login' });
