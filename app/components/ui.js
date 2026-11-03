@@ -490,53 +490,89 @@ export function Drawer({ open, onClose, title, description, children, footer, wi
   );
 }
 
-export function ActionMenu({ items, label = 'Actions', align = 'right', trigger }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef(null);
+// Menus render in a portal with fixed positioning so they always sit above
+// neighbouring content (animated rows, cards and drawers each create their own
+// stacking context, which would otherwise clip or cover an inline menu).
+export function ActionMenu({ items, label = 'Actions', align = 'right' }) {
+  const [position, setPosition] = useState(null);
+  const triggerRef = useRef(null);
+  const menuRef = useRef(null);
+  const open = !!position;
+  const close = useCallback(() => setPosition(null), []);
+  const visibleItems = items.filter((i) => i && !i.hidden);
+
+  const toggle = () => {
+    if (open) return close();
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (!rect) return undefined;
+    const estimatedHeight = visibleItems.reduce((h, i) => h + (i.divider ? 9 : 36), 10);
+    const openUp = window.innerHeight - rect.bottom < estimatedHeight + 12 && rect.top > estimatedHeight + 12;
+    const width = 210;
+    const left = align === 'right' ? Math.max(8, rect.right - width) : Math.min(rect.left, window.innerWidth - width - 8);
+    setPosition(openUp ? { left, bottom: window.innerHeight - rect.top + 6, up: true } : { left, top: rect.bottom + 6, up: false });
+    return undefined;
+  };
+
   useEffect(() => {
     if (!open) return undefined;
-    const onDown = (e) => ref.current && !ref.current.contains(e.target) && setOpen(false);
-    const onKey = (e) => e.key === 'Escape' && setOpen(false);
+    const onDown = (e) => {
+      if (menuRef.current?.contains(e.target) || triggerRef.current?.contains(e.target)) return;
+      close();
+    };
+    const onKey = (e) => e.key === 'Escape' && close();
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
     return () => {
       document.removeEventListener('mousedown', onDown);
       document.removeEventListener('keydown', onKey);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
     };
-  }, [open]);
-  const visibleItems = items.filter((i) => i && !i.hidden);
+  }, [open, close]);
+
   if (!visibleItems.length) return null;
   return (
-    <div className="relative" ref={ref} onClick={(e) => e.stopPropagation()}>
-      {trigger ? trigger({ open, toggle: () => setOpen((o) => !o) }) : (
-        <Button variant="ghost" size="icon-sm" icon={MoreHorizontal} aria-label={label} aria-expanded={open} onClick={() => setOpen((o) => !o)} />
-      )}
+    <div className="relative" ref={triggerRef} onClick={(e) => e.stopPropagation()}>
+      <Button variant="ghost" size="icon-sm" icon={MoreHorizontal} aria-label={label} aria-haspopup="menu" aria-expanded={open} onClick={toggle} />
       {open && (
-        <div className={cn('absolute z-40 mt-1.5 min-w-[200px] origin-top-right animate-scale-in rounded-xl border border-zinc-200 bg-white p-1 shadow-lift dark:border-zinc-700 dark:bg-zinc-900', align === 'right' ? 'right-0' : 'left-0')} role="menu">
-          {visibleItems.map((item, i) =>
-            item.divider ? (
-              <div key={`d${i}`} className="my-1 h-px bg-zinc-100 dark:bg-zinc-800" />
-            ) : (
-              <button
-                key={item.label}
-                type="button"
-                role="menuitem"
-                disabled={item.disabled}
-                onClick={() => {
-                  setOpen(false);
-                  item.onClick();
-                }}
-                className={cn(
-                  'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] font-medium transition-colors disabled:opacity-40',
-                  item.danger ? 'text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-500/10' : 'text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800'
-                )}
-              >
-                {item.icon && <item.icon className="h-4 w-4 opacity-70" />}
-                {item.label}
-              </button>
-            )
-          )}
-        </div>
+        <Portal>
+          <div
+            ref={menuRef}
+            role="menu"
+            onClick={(e) => e.stopPropagation()}
+            style={{ position: 'fixed', left: position.left, top: position.top, bottom: position.bottom, width: 210 }}
+            className={cn(
+              'z-[80] animate-scale-in rounded-xl border border-zinc-200 bg-white p-1 shadow-lift dark:border-zinc-700 dark:bg-zinc-900',
+              position.up ? 'origin-bottom-right' : 'origin-top-right'
+            )}
+          >
+            {visibleItems.map((item, i) =>
+              item.divider ? (
+                <div key={`d${i}`} className="my-1 h-px bg-zinc-100 dark:bg-zinc-800" />
+              ) : (
+                <button
+                  key={item.label}
+                  type="button"
+                  role="menuitem"
+                  disabled={item.disabled}
+                  onClick={() => {
+                    close();
+                    item.onClick();
+                  }}
+                  className={cn(
+                    'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] font-medium transition-colors disabled:opacity-40',
+                    item.danger ? 'text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-500/10' : 'text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800'
+                  )}
+                >
+                  {item.icon && <item.icon className="h-4 w-4 opacity-70" />}
+                  {item.label}
+                </button>
+              )
+            )}
+          </div>
+        </Portal>
       )}
     </div>
   );
